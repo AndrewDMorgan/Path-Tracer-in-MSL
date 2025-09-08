@@ -1,0 +1,329 @@
+// camera positioning and rotations
+#define CAMERA_DIR_X 1.5708 * -0.1  // facing forwards at a flat angle (angle 0 is to the right in trigonometry)
+#define CAMERA_DIR_Y 0.     // facing forwards at a flat angle (angle 0 is to the right in trigonometry)
+
+#define CAMERA_POS_X 0.0     // facing forwards at a flat angle (angle 0 is to the right in trigonometry)
+#define CAMERA_POS_Y 2.0     // facing forwards at a flat angle (angle 0 is to the right in trigonometry)
+#define CAMERA_POS_Z 10.0     // facing forwards at a flat angle (angle 0 is to the right in trigonometry)
+
+// camera view settings
+#define FOV 1.57079632679           // 90º in radians
+#define FOCAL_POINT 20.0      //
+#define APERTURE 0.14         // the amount of shifting that's applied to the offset generated for the focal point
+
+// performance settings
+#define MAX_BOUNCES 8
+#define TOTAL_RAYS 35000
+
+// ================================================ Random Number Generators and Helper Functions ================================================
+
+// branchless minimum of a and b
+inline float MinBranchless(float a, float b) {
+    return 0.5 * (a + b - metal::abs(a - b));
+}
+
+// branchless maximum of a and b
+inline float MaxBranchless(float a, float b) {
+    return 0.5 * (a + b + metal::abs(a - b));
+}
+
+inline uint Hash32 (uint x) {
+    x ^= x >> 16;
+    x *= 0x7feb352d;
+    x ^= x >> 15;
+    x *= 0x846ca68b;
+    x ^= x >> 16;
+    return x;
+}
+
+// Convert to float [0,1)
+inline float Rand (thread uint &state) {
+    state = Hash32 (state);
+    return (state & 0xFFFFFF) / float(0x1000000); // 24-bit fraction
+}
+
+inline float2 RandomPointInUnitDisk (thread uint &state) {
+    float r = metal::sqrt(Rand(state));
+    float theta = 2.0 * M_PI_F * Rand(state);
+    return float2(r * metal::cos(theta), r * metal::sin(theta));
+}
+
+// ================================================ Defining the Memory Layout for Objects and Their Properties ================================================
+
+struct Material {
+    float  roughness;  // represents how much incoming light it scattered (0 -> perfect mirror; 1 -> diffuse/matt surface
+    float  absorption;  // how much light the material absorbs (the surface could be rough but reflect all light, or just be rough, or smooth but dull)
+    float  transmittance;  // how much light will transmit through (maybe offset based on the roughness? or just blended)
+    float  index_of_refraction;
+    float  specularity;
+    float3 emission;
+    float3 color;
+};
+
+struct Object {
+    float3 point_a;
+    float3 point_b;
+    float3 point_c;
+    float3 surface_normal;
+    uint   object_id;
+    Material material;
+};
+
+// ================================================ Gathering the Initial Ray Information ================================================
+
+// generates the view angle based on the pixel coordinate
+inline void GetViewRayDirection (uint2 gid, uint2 size, thread uint &state, thread float3 &direction, thread float3 &position) {
+    // getting the uv coord (-1 to 1)
+    // (pos - size/2) / (size / 2)
+    float2 float_size = float2(size.x, size.y) * float2(0.5, 0.5);
+    float2 uv_coord = (float2(gid.x, gid.y) - float_size) / float_size;
+
+    // if the rotation code here and stuff doesn't work, blame chatGPT (I can't bother with the math)
+
+    // basic pinhole camera ray in camera space
+    float3 dir = metal::normalize(float3(uv_coord.x * metal::tan(FOV * 0.5),
+                                  uv_coord.y * metal::tan(FOV * 0.5),
+                                  -1.0));
+
+    // apply yaw (around Y) and pitch (around X)
+    float cy = metal::cos(CAMERA_DIR_X), sy = metal::sin(CAMERA_DIR_X);
+    float cx = metal::cos(CAMERA_DIR_Y), sx = metal::sin(CAMERA_DIR_Y);
+
+    // rotation matrices combined
+    float3 rotated = float3(
+        cy * dir.x + sy * dir.z,
+        sx * (cy * dir.z - sy * dir.x) + cx * dir.y,
+        cx * (cy * dir.z - sy * dir.x) - sx * dir.y
+    );
+    direction = metal::normalize(rotated);
+
+    // calculating the focal point and depth of field
+
+    float3 camera_vector;
+    camera_vector.x = metal::cos(CAMERA_DIR_X) * metal::sin(CAMERA_DIR_Y);
+    camera_vector.y = metal::sin(CAMERA_DIR_X);
+    camera_vector.z = -metal::cos(CAMERA_DIR_X) * metal::cos(CAMERA_DIR_Y);
+    camera_vector = metal::normalize(camera_vector);
+
+    // getting the focal point and aperture offsets
+    float3 world_up = float3(0.0, 1.0, 0.0); // always Y-up
+    float3 camera_right = metal::normalize(metal::cross(world_up, camera_vector));
+    float3 camera_up    = metal::cross(camera_vector, camera_right);
+
+    float2 disk = RandomPointInUnitDisk(state);
+    float3 lensOffset = camera_right * disk.x + camera_up * disk.y;
+
+    float3 focal_point = float3(CAMERA_POS_X, CAMERA_POS_Y, CAMERA_POS_Z) + direction * float3(FOCAL_POINT, FOCAL_POINT, FOCAL_POINT);
+
+    // offsetting the base position and calculating the angle to it
+    position = float3(CAMERA_POS_X, CAMERA_POS_Y, CAMERA_POS_Z) + lensOffset * APERTURE;
+    direction = metal::normalize(focal_point - position);
+}
+
+// ================================================ Tracking the Ray ================================================
+
+inline float FresnelSchlickAngle(float cosTheta, float R0) {
+    return R0 + (1.0 - R0) * metal::pow(1.0 - cosTheta, 5.0);
+}
+
+// Generates a cosine-weighted random direction over the hemisphere aligned with a normal
+inline float3 CosineWeightedRandomHemisphere(float3 normal, thread uint &state) {
+    float r1 = Rand(state);
+    float r2 = Rand(state);
+    float phi = 2.0 * M_PI_F * r1;
+    float cosTheta = metal::sqrt(1.0 - r2);
+    float sinTheta = metal::sqrt(r2);
+
+    // local space sample
+    float3 sample = float3(metal::cos(phi) * sinTheta, metal::sin(phi) * sinTheta, cosTheta);
+
+    // create tangent space aligned with normal
+    float3 up = metal::abs(normal.z) < 0.999 ? float3(0,0,1) : float3(1,0,0);
+    float3 tangent = metal::normalize(metal::cross(up, normal));
+    float3 bitangent = metal::cross(normal, tangent);
+
+    // transform sample from tangent to world space
+    return tangent * sample.x + bitangent * sample.y + normal * sample.z;
+}
+
+// index_of_refraction_ration represents: current_medium_ior / ior_for_medium_being_entered
+inline void BounceRay (thread float3 &direction, thread float3 &position, thread float3 &surface_normal, thread Material &material, float index_of_refraction_ration, thread uint &state) {
+    // calculating the reflection direction (also account for the fresnel coefficient)
+    float3 reflected = metal::reflect(direction, surface_normal);
+
+    float cosTheta = metal::dot(-direction, surface_normal);
+    float fresnel = FresnelSchlickAngle(cosTheta, 1 - material.absorption);
+    float reflectRatio = fresnel;
+
+    // calculating the refracted direction
+    float3 refracted = metal::refract(direction, surface_normal, index_of_refraction_ration);
+
+    float random_unit_state = Rand(state);
+    // transparency:  0 -> opaque, 1 -> perfectly clear
+    float3 unit_scattering_direction = CosineWeightedRandomHemisphere(surface_normal, state);
+    float3 refracted_direction = (random_unit_state < material.transmittance) ? refracted : unit_scattering_direction;
+
+    // choosing between the reflected and scattered vectors based on a random state and reflectivity
+    random_unit_state = Rand(state);
+
+    // a value of 0 in the refracted direction indicates a total internal reflection
+    bool condition = random_unit_state < reflectRatio || (refracted.x < 0.001 && refracted.y < 0.001 && refracted.z < 0.001);
+    reflected = metal::normalize(reflected * (1.0 - material.roughness) + unit_scattering_direction * (material.roughness));
+    direction = condition ? reflected : refracted_direction;
+    float error_margin = condition || random_unit_state >= material.transmittance ? 0.001 : -0.001;
+    position += surface_normal * float3(error_margin, error_margin, error_margin);  // making sure it's not actually on the object to prevent errors (when refracting it needs to do the opposite)
+}
+
+inline void RayIntersectsTriangle_Branchless (
+    thread const float3 &origin,
+    thread const float3 &direction,
+    float3 A,
+    float3 B,
+    float3 C,
+    thread float &t_out,
+    thread float3 &position_out,
+    thread float &mask // 1.0 if intersecting, 0.0 otherwise
+) {
+    const float EPSILON = 0.0001;
+
+    float3 edge1 = B - A;
+    float3 edge2 = C - A;
+    float3 h = metal::cross(direction, edge2);
+    float det = metal::dot(edge1, h);
+
+    float invDet = 1.0 / (det + (det == 0.0 ? EPSILON : 0.0)); // avoid division by zero
+
+    float3 s = origin - A;
+    float u = metal::dot(s, h) * invDet;
+    float3 q = metal::cross(s, edge1);
+    float v = metal::dot(direction, q) * invDet;
+    float t = metal::dot(edge2, q) * invDet;
+
+    // branchless masks
+    float mask_det = metal::step(EPSILON, metal::abs(det));
+    float mask_u = metal::step(0.0, u) * metal::step(u, 1.0);
+    float mask_v = metal::step(0.0, v) * metal::step(u + v, 1.0);
+    float mask_t = metal::step(EPSILON, t);
+
+    mask = mask_det * mask_u * mask_v * mask_t;
+
+    // compute intersection point only if mask != 0
+    position_out = origin + direction * t * mask;
+    t_out = t * mask;
+}
+
+inline void TraceRay (
+               thread   float3        &color,
+               thread   float3        &direction,
+               thread   float3        &position,
+               device   const  Object* objects,
+               constant uint&          num_objects,
+               thread   uint          &state
+) {
+    // color represents the color accumulation
+    float transmission = 1.;  // transmission represents how much of the color can make it back to the camera
+    float3 brightness = float3(0., 0., 0.);  // brightness represents how strong of light can actually make it back to the camera (brightness * color_acc = final color; color_acc += col * transmission)
+
+    float indexes_of_refraction[100];  // acting as a stack; hopefully nothing will overflow
+    indexes_of_refraction[0] = 1.0003;  // index 0 would be air/null
+    uint index_for_refraction_stack = 0;
+
+    uint object_ids[100];  // acting as a stack; hopefully nothing will overflow
+    object_ids[0] = 0;  // index 0 would be air/null
+    //uint last_object_id_index = 0;  // this stack *should* line up with that of the refractive indexes
+
+    for (uint depth = 0; depth < MAX_BOUNCES; depth++) {
+        // emission sources should have an absorption of 100%; this prevents further light from accumulating while avoiding branch diversion from an early exit
+
+        // going through and checking for a collision
+        bool collided = false;
+        uint nearest_index = 0;
+        float3 nearest_collision = float3(0., 0., 0.);
+        float nearest_distance = 9999999.;  // big number; hopefully bigger than any real object's would have
+        for (uint object_index = 0; object_index < num_objects; object_index++) {
+            Object object = objects[object_index];
+            float mask;
+            float distance_to_collision;  // distance to collision
+            float3 collision_position;
+            RayIntersectsTriangle_Branchless(position, direction, object.point_a, object.point_b, object.point_c, distance_to_collision, collision_position, mask);
+            bool collision_at_point = mask >= 0.99;
+            collided = collided || collision_at_point;
+            nearest_index = distance_to_collision < nearest_distance && collision_at_point ? object_index : nearest_index;
+            nearest_collision = distance_to_collision < nearest_distance && collision_at_point ? collision_position : nearest_collision;
+            nearest_distance = distance_to_collision < nearest_distance && collision_at_point ? distance_to_collision : nearest_distance;
+        }
+
+        // while this will introduce divergence, it won't hurt performance
+        // if a ray exits early, but others continue to MAX_BOUNCES, it'll still do the same work
+        // if all rays don't hit the maximum depth, then time will be saved.
+        // there are no looses, but a potential gain in some scenes
+        if (!collided) break;  // does seem to improve performance quite a bit in open scenes (enclosed ones won't get any benefits)
+
+        // making sure once in blank space no further color is accumulated to prevent weird artifacts (to avoid divergence the ray still needs to be calculated)
+        //transmission = collided ? transmission : 0.;
+        position = nearest_collision;
+        Object object = objects[nearest_index];
+
+        // updating the color based on the object's properties
+        brightness += object.material.emission * float3(transmission, transmission, transmission);
+        color += object.material.color * float3(transmission, transmission, transmission);
+        transmission *= 1. - object.material.absorption;
+
+        float current_index_of_refraction = indexes_of_refraction[index_for_refraction_stack];
+        // checking if the indexes need to change
+        index_for_refraction_stack = object.object_id == object_ids[index_for_refraction_stack] ? index_for_refraction_stack - 1 : index_for_refraction_stack + 1;
+        object_ids[index_for_refraction_stack] = object.object_id;
+        indexes_of_refraction[index_for_refraction_stack] = object.material.index_of_refraction;
+        float refraction_ratio = current_index_of_refraction / indexes_of_refraction[index_for_refraction_stack];
+
+        BounceRay(direction, position, object.surface_normal, object.material, refraction_ratio, state);
+    }
+    // brightness represents how much of each light made it back while the color represents the colors of impacted objects along the path of the light
+    color *= brightness;// * float3(transmission, transmission, transmission);
+}
+
+// ================================================ Main Entry Kernel Function ================================================
+
+inline float3 ToneMap_Uncharted2(float3 x) {
+    const float A = 0.15;
+    const float B = 0.50;
+    const float C = 0.10;
+    const float D = 0.20;
+    const float E = 0.02;
+    const float F = 0.30;
+    return ((x * (A * x + C * B) + D * E) / (x * (A * x + B) + D * F)) - E / F;
+}
+
+kernel void TraceRays (
+    device const Object* objects     [[ buffer(0) ]],
+    device float*        output      [[ buffer(1) ]],
+    constant uint&       width       [[ buffer(2) ]],
+    constant uint&       height      [[ buffer(3) ]],
+    constant uint&       num_objects [[ buffer(4) ]],
+    uint2 gid [[ thread_position_in_grid ]]
+) {
+    uint pixel_index = gid.y * width + gid.x;
+    uint base_index = pixel_index * 3;
+
+    // the state for random number generation
+    uint state = base_index * 10000;
+
+    float3 color = float3(0., 0., 0.);  // getting the average color contribution
+    for (uint i = 0; i < TOTAL_RAYS; i++) {
+        float3 ray_direction;
+        float3 ray_position;
+        GetViewRayDirection(gid, uint2(width, height), state, ray_direction, ray_position);
+
+        float3 ray_color = float3(0., 0., 0.);
+        // ray position and float3 will be mutated so future references are not valid
+        TraceRay(ray_color, ray_direction, ray_position, objects, num_objects, state);
+        color += ray_color;
+    }
+    color /= float3(TOTAL_RAYS, TOTAL_RAYS, TOTAL_RAYS);
+    color = ToneMap_Uncharted2(color);
+
+    // the color channels are between 0 and 1
+    output[base_index + 0] = color.x; // R
+    output[base_index + 1] = color.y; // G
+    output[base_index + 2] = color.z; // B
+}

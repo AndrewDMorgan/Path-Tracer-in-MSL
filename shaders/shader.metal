@@ -13,7 +13,7 @@
 
 // performance settings
 #define MAX_BOUNCES 8
-#define TOTAL_RAYS 35000
+#define TOTAL_RAYS 2500
 
 // ================================================ Random Number Generators and Helper Functions ================================================
 
@@ -147,31 +147,68 @@ inline float3 CosineWeightedRandomHemisphere(float3 normal, thread uint &state) 
 }
 
 // index_of_refraction_ration represents: current_medium_ior / ior_for_medium_being_entered
-inline void BounceRay (thread float3 &direction, thread float3 &position, thread float3 &surface_normal, thread Material &material, float index_of_refraction_ration, thread uint &state) {
+inline void BounceRay (thread float3 &direction,
+                       thread float3 &position,
+                       thread float3 &surface_normal,
+                       thread Object &object,
+                       thread uint &state,
+                       thread uint &index_for_refraction_stack,
+                       thread float *indexes_of_refraction,
+                       thread uint *object_ids
+) {
+    Material material = object.material;
+
+    // this should allow any object to be hit from any side and still correctly return the right value
+    float sign = -metal::sign(metal::dot(surface_normal, direction));  // making sure the normal is align regardless of which side is hit
+    surface_normal *= float3(sign, sign, sign);
+
+    // getting the index of refraction
+    float index_of_refraction_ration = material.index_of_refraction / indexes_of_refraction[index_for_refraction_stack];
+
     // calculating the reflection direction (also account for the fresnel coefficient)
     float3 reflected = metal::reflect(direction, surface_normal);
 
     float cosTheta = metal::dot(-direction, surface_normal);
-    float fresnel = FresnelSchlickAngle(cosTheta, 1 - material.absorption);
-    float reflectRatio = fresnel;
+    float reflectRatio = FresnelSchlickAngle(cosTheta, (1 - material.absorption) * (1. - material.transmittance * 1.));
 
     // calculating the refracted direction
     float3 refracted = metal::refract(direction, surface_normal, index_of_refraction_ration);
+    refracted = metal::normalize(refracted * (1.0 - material.roughness) + CosineWeightedRandomHemisphere(refracted, state) * (material.roughness));
 
     float random_unit_state = Rand(state);
     // transparency:  0 -> opaque, 1 -> perfectly clear
     float3 unit_scattering_direction = CosineWeightedRandomHemisphere(surface_normal, state);
-    float3 refracted_direction = (random_unit_state < material.transmittance) ? refracted : unit_scattering_direction;
+
+    bool refracted_condition = random_unit_state < material.transmittance;
+    float3 refracted_direction = refracted_condition ? refracted : unit_scattering_direction;
 
     // choosing between the reflected and scattered vectors based on a random state and reflectivity
     random_unit_state = Rand(state);
 
     // a value of 0 in the refracted direction indicates a total internal reflection
-    bool condition = random_unit_state < reflectRatio || (refracted.x < 0.001 && refracted.y < 0.001 && refracted.z < 0.001);
+    bool condition = random_unit_state < reflectRatio || (metal::abs(refracted.x) < 0.001 && metal::abs(refracted.y) < 0.001 && metal::abs(refracted.z) < 0.001);
     reflected = metal::normalize(reflected * (1.0 - material.roughness) + unit_scattering_direction * (material.roughness));
     direction = condition ? reflected : refracted_direction;
-    float error_margin = condition || random_unit_state >= material.transmittance ? 0.001 : -0.001;
+    bool condition_of_final_refraction = condition || !refracted_condition;
+    float error_margin = condition_of_final_refraction ? 0.001 : -0.001;
+    //current_index_of_refraction = condition || !refracted_condition ? current_index_of_refraction : new_index;
     position += surface_normal * float3(error_margin, error_margin, error_margin);  // making sure it's not actually on the object to prevent errors (when refracting it needs to do the opposite)
+
+    // updating the refraction stack based on the material/object ids
+    // (!condition_of_final_refraction && !condition && cur_id != id)   if the ray is entering a new material -> psh (new ior && object id)
+    // (!condition_of_final_refraction && !condition && cur_id == id)   if the material == the current stack material -> pop (no new ior or id)
+    // (condition_of_final_refraction)   if the ray isn't entering/exiting anything (reflecting/diffusing) -> nothing (no new ior or id)
+
+    bool need_to_psh = !condition_of_final_refraction && !condition && object.object_id != object_ids[index_for_refraction_stack];
+    bool need_to_pop = !condition_of_final_refraction && !condition && !need_to_psh;
+    bool nothing_needed = !need_to_psh && !need_to_pop;
+
+    // calculating the new index for the stack
+    index_for_refraction_stack = (index_for_refraction_stack + 1)*(need_to_psh) + (index_for_refraction_stack - 1)*(need_to_pop) + index_for_refraction_stack*(nothing_needed);
+
+    // updating the ior and id
+    object_ids[index_for_refraction_stack] = need_to_psh ? object.object_id : object_ids[index_for_refraction_stack];
+    indexes_of_refraction[index_for_refraction_stack] = need_to_psh ? material.index_of_refraction : indexes_of_refraction[index_for_refraction_stack];
 }
 
 inline void RayIntersectsTriangle_Branchless (
@@ -269,14 +306,7 @@ inline void TraceRay (
         color += object.material.color * float3(transmission, transmission, transmission);
         transmission *= 1. - object.material.absorption;
 
-        float current_index_of_refraction = indexes_of_refraction[index_for_refraction_stack];
-        // checking if the indexes need to change
-        index_for_refraction_stack = object.object_id == object_ids[index_for_refraction_stack] ? index_for_refraction_stack - 1 : index_for_refraction_stack + 1;
-        object_ids[index_for_refraction_stack] = object.object_id;
-        indexes_of_refraction[index_for_refraction_stack] = object.material.index_of_refraction;
-        float refraction_ratio = current_index_of_refraction / indexes_of_refraction[index_for_refraction_stack];
-
-        BounceRay(direction, position, object.surface_normal, object.material, refraction_ratio, state);
+        BounceRay(direction, position, object.surface_normal, object, state, index_for_refraction_stack, indexes_of_refraction, object_ids);
     }
     // brightness represents how much of each light made it back while the color represents the colors of impacted objects along the path of the light
     color *= brightness;// * float3(transmission, transmission, transmission);

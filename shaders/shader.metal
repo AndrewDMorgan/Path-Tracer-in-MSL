@@ -13,7 +13,7 @@
 
 // performance settings
 #define MAX_BOUNCES 8
-#define TOTAL_RAYS 2500
+#define TOTAL_RAYS 100
 
 // ================================================ Random Number Generators and Helper Functions ================================================
 
@@ -56,6 +56,8 @@ struct Material {
     float  transmittance;  // how much light will transmit through (maybe offset based on the roughness? or just blended)
     float  index_of_refraction;
     float  specularity;
+    float  scattering;
+    float  scattering_type;
     float3 emission;
     float3 color;
 };
@@ -146,6 +148,54 @@ inline float3 CosineWeightedRandomHemisphere(float3 normal, thread uint &state) 
     return tangent * sample.x + bitangent * sample.y + normal * sample.z;
 }
 
+inline float3 SampleHG_World(float3 wi, float g, thread uint &state) {
+    // Random numbers
+    float xi1 = Rand(state);  // [0,1)
+    float xi2 = Rand(state);  // [0,1)
+
+    // Branchless cos(theta) computation
+    float invG = 1.0 / g;
+    float sqrTerm = (1.0 - g*g) / (1.0 - g + 2.0 * g * xi1);
+    float cosTheta_aniso = (1.0 + g*g - sqrTerm*sqrTerm) * 0.5 * invG;
+
+    // Isotropic case
+    float cosTheta_iso = 1.0 - 2.0 * xi1;
+
+    // Blend based on g != 0
+    float gNonZero = metal::step(1e-3, metal::abs(g));       // 0 if g ~ 0, 1 if g != 0
+    float cosTheta = gNonZero * cosTheta_aniso + (1.0 - gNonZero) * cosTheta_iso;
+
+    // Spherical coordinates
+    float sinTheta = metal::sqrt(metal::max(0.0, 1.0 - cosTheta*cosTheta));
+    float phi = 2.0 * M_PI_F * xi2;
+
+    // Local direction
+    float3 localDir = float3(sinTheta * metal::cos(phi), sinTheta * metal::sin(phi), cosTheta);
+
+    // Build orthonormal basis around wi
+    float3 w = metal::normalize(wi);
+    float3 a = metal::abs(w.z) < 0.999 ? float3(0,0,1) : float3(1,0,0);
+    float3 v = metal::normalize(metal::cross(a, w));
+    float3 u = metal::cross(w, v);
+
+    // Rotate localDir to world space
+    float3 worldDir = localDir.x * u + localDir.y * v + localDir.z * w;
+    return worldDir;
+}
+
+inline void ScatterRays (thread bool &scattered, constant Material *last_material, thread const float &nearest_distance, thread uint &state, thread float3 &direction, thread float3 &position) {
+    // t = −ln(ξ)/σt    ξ is [0, 1) random; σt is the scattering * absorption. (The distance to the next reflection is necessary, so put it in another function)
+    float random_unit_state = Rand(state);
+    float scatter_distance = -metal::log(random_unit_state) / (last_material->scattering * last_material->absorption);
+
+    // checking if the maximum distance is greater or not (if so scattering, otherwise continuing)
+    scattered = scatter_distance < nearest_distance;
+    float3 new_position = position + direction * float3(scatter_distance, scatter_distance, scatter_distance);
+    position = scattered ? new_position : position;  // updating the position to be at the position calculated to be scattering
+    float3 scattered_direction = SampleHG_World(direction, last_material->scattering_type, state);
+    direction = scattered ? scattered_direction : direction;
+}
+
 // index_of_refraction_ration represents: current_medium_ior / ior_for_medium_being_entered
 inline void BounceRay (thread float3 &direction,
                        thread float3 &position,
@@ -154,7 +204,9 @@ inline void BounceRay (thread float3 &direction,
                        thread uint &state,
                        thread uint &index_for_refraction_stack,
                        thread float *indexes_of_refraction,
-                       thread uint *object_ids
+                       thread uint *object_ids,
+                       constant Material** materials,
+                       constant Material* current_material
 ) {
     Material material = object.material;
 
@@ -169,7 +221,7 @@ inline void BounceRay (thread float3 &direction,
     float3 reflected = metal::reflect(direction, surface_normal);
 
     float cosTheta = metal::dot(-direction, surface_normal);
-    float reflectRatio = FresnelSchlickAngle(cosTheta, (1 - material.absorption) * (1. - material.transmittance * 1.));
+    float reflectRatio = FresnelSchlickAngle(cosTheta, 1 - material.absorption);
 
     // calculating the refracted direction
     float3 refracted = metal::refract(direction, surface_normal, index_of_refraction_ration);
@@ -209,6 +261,7 @@ inline void BounceRay (thread float3 &direction,
     // updating the ior and id
     object_ids[index_for_refraction_stack] = need_to_psh ? object.object_id : object_ids[index_for_refraction_stack];
     indexes_of_refraction[index_for_refraction_stack] = need_to_psh ? material.index_of_refraction : indexes_of_refraction[index_for_refraction_stack];
+    materials[index_for_refraction_stack] = need_to_psh ? current_material : materials[index_for_refraction_stack];
 }
 
 inline void RayIntersectsTriangle_Branchless (
@@ -253,19 +306,22 @@ inline void TraceRay (
                thread   float3        &color,
                thread   float3        &direction,
                thread   float3        &position,
-               device   const  Object* objects,
+               constant  Object*       objects,
                constant uint&          num_objects,
-               thread   uint          &state
+               thread   uint          &state,
+               constant Material*      starting_volume  // raw pointers on gpu's are just so wonderful...
 ) {
     // color represents the color accumulation
     float transmission = 1.;  // transmission represents how much of the color can make it back to the camera
     float3 brightness = float3(0., 0., 0.);  // brightness represents how strong of light can actually make it back to the camera (brightness * color_acc = final color; color_acc += col * transmission)
 
-    float indexes_of_refraction[100];  // acting as a stack; hopefully nothing will overflow
+    float indexes_of_refraction[MAX_BOUNCES + 1];  // acting as a stack; hopefully nothing will overflow
+    constant Material* materials[MAX_BOUNCES + 1];
+    materials[0] = starting_volume;
     indexes_of_refraction[0] = 1.0003;  // index 0 would be air/null
     uint index_for_refraction_stack = 0;
 
-    uint object_ids[100];  // acting as a stack; hopefully nothing will overflow
+    uint object_ids[MAX_BOUNCES + 1];  // acting as a stack; hopefully nothing will overflow
     object_ids[0] = 0;  // index 0 would be air/null
     //uint last_object_id_index = 0;  // this stack *should* line up with that of the refractive indexes
 
@@ -294,19 +350,37 @@ inline void TraceRay (
         // if a ray exits early, but others continue to MAX_BOUNCES, it'll still do the same work
         // if all rays don't hit the maximum depth, then time will be saved.
         // there are no looses, but a potential gain in some scenes
-        if (!collided) break;  // does seem to improve performance quite a bit in open scenes (enclosed ones won't get any benefits)
+        float sun_angle_portion = metal::dot(metal::normalize(float3(0.4, 1.2, 0.3)), direction) * 0.5 + 0.5;
+        float clamped = (sun_angle_portion > 1. ? 1. : sun_angle_portion);
+        sun_angle_portion = (sun_angle_portion < 0. ? 0. : clamped);
+        brightness += (collided ? float3(0., 0., 0.) : float3(4., 4., 5.2)) * float3(transmission * sun_angle_portion, transmission * sun_angle_portion, transmission * sun_angle_portion);
+        color += (collided ? float3(0., 0., 0.) : float3(1., 1., 1.)) * float3(transmission * sun_angle_portion, transmission * sun_angle_portion, transmission * sun_angle_portion);
+        if (!collided) break;  // does seem to improve performance quite a bit in open scenes (enclosed ones won't get any benefits, but shouldn't be hurt)
 
         // making sure once in blank space no further color is accumulated to prevent weird artifacts (to avoid divergence the ray still needs to be calculated)
         //transmission = collided ? transmission : 0.;
-        position = nearest_collision;
+
+        // first checking if scattering needs to first happen
+        bool scattered = false;
+        constant Material* last_material = materials[index_for_refraction_stack];
+        ScatterRays(scattered, last_material, nearest_distance, state, direction, position);
+        brightness += scattered ? last_material->emission * float3(transmission, transmission, transmission) : float3(0., 0., 0.);
+        color += scattered ? last_material->color * float3(transmission, transmission, transmission) : float3(0., 0., 0.);
+        transmission *= scattered ? (1. - last_material->absorption) : 1.;
+
+        // hopefully this won't cause too much divergence (volumes won't likely be common), but honestly either way the following are going to be redundant (and manually storing the state is complex)
         Object object = objects[nearest_index];
+        float3 corrected_position = position + object.surface_normal * -metal::sign(metal::dot(object.surface_normal, direction)) * float3(0.01, 0.01, 0.01);
+        position = !scattered && object.material.scattering > 0. ? corrected_position : position;  // in case it doesn't scatter and lands on the surface (preventing floating point errors)
+        if (scattered || object.material.scattering > 0.) {  continue;  }
+        position = nearest_collision;
 
         // updating the color based on the object's properties
         brightness += object.material.emission * float3(transmission, transmission, transmission);
         color += object.material.color * float3(transmission, transmission, transmission);
-        transmission *= 1. - object.material.absorption;
+        transmission *= (1. - object.material.absorption * (1. - object.material.transmittance));
 
-        BounceRay(direction, position, object.surface_normal, object, state, index_for_refraction_stack, indexes_of_refraction, object_ids);
+        BounceRay(direction, position, object.surface_normal, object, state, index_for_refraction_stack, indexes_of_refraction, object_ids, materials, &objects[nearest_index].material);
     }
     // brightness represents how much of each light made it back while the color represents the colors of impacted objects along the path of the light
     color *= brightness;// * float3(transmission, transmission, transmission);
@@ -325,18 +399,20 @@ inline float3 ToneMap_Uncharted2(float3 x) {
 }
 
 kernel void TraceRays (
-    device const Object* objects     [[ buffer(0) ]],
+    constant Object*     objects     [[ buffer(0) ]],
     device float*        output      [[ buffer(1) ]],
     constant uint&       width       [[ buffer(2) ]],
     constant uint&       height      [[ buffer(3) ]],
     constant uint&       num_objects [[ buffer(4) ]],
+    constant uint&       frame       [[ buffer(5) ]],
+    constant Material* starting_volume [[ buffer(6) ]],
     uint2 gid [[ thread_position_in_grid ]]
 ) {
     uint pixel_index = gid.y * width + gid.x;
     uint base_index = pixel_index * 3;
 
     // the state for random number generation
-    uint state = base_index * 10000;
+    uint state = pixel_index * 10000 + frame * (width * height * 10000);
 
     float3 color = float3(0., 0., 0.);  // getting the average color contribution
     for (uint i = 0; i < TOTAL_RAYS; i++) {
@@ -346,7 +422,7 @@ kernel void TraceRays (
 
         float3 ray_color = float3(0., 0., 0.);
         // ray position and float3 will be mutated so future references are not valid
-        TraceRay(ray_color, ray_direction, ray_position, objects, num_objects, state);
+        TraceRay(ray_color, ray_direction, ray_position, objects, num_objects, state, starting_volume);
         color += ray_color;
     }
     color /= float3(TOTAL_RAYS, TOTAL_RAYS, TOTAL_RAYS);

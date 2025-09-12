@@ -1,25 +1,26 @@
 // camera positioning and rotations
-#define CAMERA_DIR_X 1.5708 * -0.1  // facing forwards at a flat angle (angle 0 is to the right in trigonometry)
-#define CAMERA_DIR_Y 0.     // facing forwards at a flat angle (angle 0 is to the right in trigonometry)
+#define CAMERA_DIR_X 1.5708 * 0.  // facing forwards at a flat angle (angle 0 is to the right in trigonometry)
+#define CAMERA_DIR_Y 1.3     // facing forwards at a flat angle (angle 0 is to the right in trigonometry)
 
 #define CAMERA_POS_X 0.0     // facing forwards at a flat angle (angle 0 is to the right in trigonometry)
-#define CAMERA_POS_Y 2.0     // facing forwards at a flat angle (angle 0 is to the right in trigonometry)
-#define CAMERA_POS_Z 10.0     // facing forwards at a flat angle (angle 0 is to the right in trigonometry)
+#define CAMERA_POS_Y 10.0     // facing forwards at a flat angle (angle 0 is to the right in trigonometry)
+#define CAMERA_POS_Z 0.0     // facing forwards at a flat angle (angle 0 is to the right in trigonometry)
 
 // camera view settings
 #define FOV 1.57079632679           // 90º in radians
 #define FOCAL_POINT 20.0      //
 #define APERTURE 0.14         // the amount of shifting that's applied to the offset generated for the focal point
 
-// performance settings
+#define STACK_SIZE 8  // overflows are protected against, however it would result in artifacts and incorrect results; lower values may improve performance though
 #define MAX_BOUNCES 8
-#define TOTAL_RAYS 100
+
+#define NODE_STACK_SIZE_MULTIPLE_OF_FOUR 16  // this needs to be equal to the rust end
 
 // ================================================ Random Number Generators and Helper Functions ================================================
 
 // branchless minimum of a and b
 inline float MinBranchless(float a, float b) {
-    return 0.5 * (a + b - metal::abs(a - b));
+    return a < b ? a : b;
 }
 
 // branchless maximum of a and b
@@ -50,6 +51,12 @@ inline float2 RandomPointInUnitDisk (thread uint &state) {
 
 // ================================================ Defining the Memory Layout for Objects and Their Properties ================================================
 
+struct Light {
+    uint index;
+    float area_weight;
+    float area;
+};
+
 struct Material {
     float  roughness;  // represents how much incoming light it scattered (0 -> perfect mirror; 1 -> diffuse/matt surface
     float  absorption;  // how much light the material absorbs (the surface could be rough but reflect all light, or just be rough, or smooth but dull)
@@ -60,6 +67,7 @@ struct Material {
     float  scattering_type;
     float3 emission;
     float3 color;
+    bool is_volume;
 };
 
 struct Object {
@@ -69,6 +77,13 @@ struct Object {
     float3 surface_normal;
     uint   object_id;
     Material material;
+};
+
+struct BVH {
+    device uint (*object_indexes)[NODE_STACK_SIZE_MULTIPLE_OF_FOUR];
+    device float4 (*children_aabb)[2];
+    device uint4 *children;
+    device Object *objects;
 };
 
 // ================================================ Gathering the Initial Ray Information ================================================
@@ -186,14 +201,40 @@ inline float3 SampleHG_World(float3 wi, float g, thread uint &state) {
 inline void ScatterRays (thread bool &scattered, constant Material *last_material, thread const float &nearest_distance, thread uint &state, thread float3 &direction, thread float3 &position) {
     // t = −ln(ξ)/σt    ξ is [0, 1) random; σt is the scattering * absorption. (The distance to the next reflection is necessary, so put it in another function)
     float random_unit_state = Rand(state);
-    float scatter_distance = -metal::log(random_unit_state) / (last_material->scattering * last_material->absorption);
+    float ot = last_material->scattering + last_material->absorption;
+    //ot = ot < 0.001 ? 0.001 : ot;  // making sure it isn't zero incase something weird happens
+    float scatter_distance = -metal::log(random_unit_state) / ot;
 
     // checking if the maximum distance is greater or not (if so scattering, otherwise continuing)
-    scattered = scatter_distance < nearest_distance;
+    scattered = scatter_distance < nearest_distance && last_material->scattering > 0.;
     float3 new_position = position + direction * float3(scatter_distance, scatter_distance, scatter_distance);
-    position = scattered ? new_position : position;  // updating the position to be at the position calculated to be scattering
+    position = scattered && last_material->scattering > 0. ? new_position : position;  // updating the position to be at the position calculated to be scattering
     float3 scattered_direction = SampleHG_World(direction, last_material->scattering_type, state);
-    direction = scattered ? scattered_direction : direction;
+    direction = scattered && last_material->scattering > 0. ? scattered_direction : direction;
+}
+
+inline float Checked (float numeral) {
+    return metal::abs(numeral) < 0.00001 ? 0.00001 : numeral;
+}
+
+inline float GetWeightedMIS (constant Material* material, thread float3 &direction, thread float3 &direction_to_light, thread float3 &surface_normal, float distance_to_light) {
+    // volumetric calculations
+    bool is_volume = material->scattering > 0. ? 1. : 0.;
+    float distance_attenuation = metal::exp(-(material->scattering + material->absorption) * distance_to_light);
+    float gg = material->scattering_type*material->scattering_type;
+    float greenstein_div = 4.*M_PI_F*metal::pow(1. + gg - 2. * material->scattering_type * metal::dot(direction, direction_to_light), 2. / 3.);
+    float greenstein_factor = (1. - gg) / Checked(greenstein_div * is_volume * distance_attenuation);
+
+    float3 h = (direction + direction_to_light) / Checked(metal::length(direction + direction_to_light));
+    float surface_term1 = (1. - material->specularity) * metal::max(0., metal::dot(surface_normal, direction_to_light)) / M_PI_F;
+    float h_norm = metal::dot(h, surface_normal);
+    float asqur = (material->roughness*material->roughness);
+    float factor = (h_norm * h_norm) * (asqur - 1.) + 1.;
+    float denom_of_surf = M_PI_F * (factor*factor);
+    float numerator = asqur / Checked(denom_of_surf);
+    float surface_term2 = material->specularity * (numerator * h_norm) / Checked(4. * metal::dot(direction, h));
+    float surface = surface_term1 + surface_term2;
+    return surface * (1. - is_volume) + greenstein_factor;
 }
 
 // index_of_refraction_ration represents: current_medium_ior / ior_for_medium_being_entered
@@ -203,8 +244,8 @@ inline void BounceRay (thread float3 &direction,
                        thread Object &object,
                        thread uint &state,
                        thread uint &index_for_refraction_stack,
-                       thread float *indexes_of_refraction,
-                       thread uint *object_ids,
+                       thread float* indexes_of_refraction,
+                       thread uint* object_ids,
                        constant Material** materials,
                        constant Material* current_material
 ) {
@@ -251,13 +292,13 @@ inline void BounceRay (thread float3 &direction,
     // (!condition_of_final_refraction && !condition && cur_id == id)   if the material == the current stack material -> pop (no new ior or id)
     // (condition_of_final_refraction)   if the ray isn't entering/exiting anything (reflecting/diffusing) -> nothing (no new ior or id)
 
-    bool need_to_psh = !condition_of_final_refraction && !condition && object.object_id != object_ids[index_for_refraction_stack];
-    bool need_to_pop = !condition_of_final_refraction && !condition && !need_to_psh;
+    bool need_to_psh = !condition_of_final_refraction && !condition && object.object_id != object_ids[index_for_refraction_stack] && material.is_volume;
+    bool need_to_pop = !condition_of_final_refraction && !condition && !need_to_psh && material.is_volume;
     bool nothing_needed = !need_to_psh && !need_to_pop;
 
     // calculating the new index for the stack
     index_for_refraction_stack = (index_for_refraction_stack + 1)*(need_to_psh) + (index_for_refraction_stack - 1)*(need_to_pop) + index_for_refraction_stack*(nothing_needed);
-
+    index_for_refraction_stack = MinBranchless(STACK_SIZE - 1, index_for_refraction_stack);
     // updating the ior and id
     object_ids[index_for_refraction_stack] = need_to_psh ? object.object_id : object_ids[index_for_refraction_stack];
     indexes_of_refraction[index_for_refraction_stack] = need_to_psh ? material.index_of_refraction : indexes_of_refraction[index_for_refraction_stack];
@@ -302,6 +343,82 @@ inline void RayIntersectsTriangle_Branchless (
     t_out = t * mask;
 }
 
+inline void CheckCollisions (constant Object* objects,
+                             constant uint& num_objects,
+                             thread bool& collided,
+                             thread uint& nearest_index,
+                             thread float& nearest_distance,
+                             thread float3& nearest_collision,
+                             thread float3& position,
+                             thread float3& direction
+) {
+    for (uint object_index = 0; object_index < num_objects; object_index++) {
+        Object object = objects[object_index];
+        float mask;
+        float distance_to_collision;  // distance to collision
+        float3 collision_position;
+        RayIntersectsTriangle_Branchless(position, direction, object.point_a, object.point_b, object.point_c, distance_to_collision, collision_position, mask);
+        bool collision_at_point = mask >= 0.99;
+        collided = collided || collision_at_point;
+        nearest_index = distance_to_collision < nearest_distance && collision_at_point ? object_index : nearest_index;
+        nearest_collision = distance_to_collision < nearest_distance && collision_at_point ? collision_position : nearest_collision;
+        nearest_distance = distance_to_collision < nearest_distance && collision_at_point ? distance_to_collision : nearest_distance;
+    }
+}
+
+inline float3 SampleTrianglePoint(constant float3& A, constant float3& B, constant float3& C, thread uint &state) {
+    float u = Rand(state);
+    float v = Rand(state);
+
+    float su = metal::sqrt(u);   // square root warp
+    float b0 = 1.0 - su;
+    float b1 = su * (1.0 - v);
+    float b2 = su * v;
+
+    return b0 * A + b1 * B + b2 * C;
+}
+
+// why does chatgpt lie so much?
+inline void CheckForLights (thread float3& start_position,
+                            thread float3& direction,
+                            thread float3& brightness,
+                            thread float& transmission,
+                            constant Material* material,
+                            thread float3& normal,
+                            constant Light* lights,
+                            constant uint& num_lights,
+                            constant Object* objects,
+                            constant uint& num_objects,
+                            thread uint& state
+) {
+    // correcting the direction of the surface normal
+    float sign = -metal::sign(metal::dot(direction, normal));
+    float3 surface_normal = normal * float3(sign, sign, sign);
+    // making sure there aren't any floating point precision errors
+    float3 position = start_position + surface_normal * float3(0.001, 0.001, 0.001);
+
+    float random_unit_state = Rand(state);
+    uint random_index = uint(random_unit_state * num_lights);
+    constant Light* light = &lights[random_index];
+    constant Object* light_object = &objects[light->index];
+
+    float3 light_position_sample = SampleTrianglePoint(light_object->point_a, light_object->point_b, light_object->point_c, state);
+    float3 direction_to_light = metal::normalize(light_position_sample - position);
+
+    // going through and checking for a collision
+    bool collided = false;
+    uint nearest_index = 0;
+    float3 nearest_collision = float3(0., 0., 0.);
+    float nearest_distance = 9999999.;  // big number; hopefully bigger than any real object's would have
+    CheckCollisions(objects, num_objects, collided, nearest_index, nearest_distance, nearest_collision, position, direction_to_light);
+
+    float pdf = GetWeightedMIS(material, direction, direction_to_light, surface_normal, nearest_distance);
+    float weight = light->area_weight * (1. / (nearest_distance * nearest_distance));
+    weight /= metal::max(pdf, 0.0001);
+    float3 final_emission = light_object->material.emission * float3(transmission, transmission, transmission) * float3(weight, weight, weight);
+    brightness += collided && nearest_index != light->index || metal::isnan(weight) ? float3(0., 0., 0.) : final_emission;
+}
+
 inline void TraceRay (
                thread   float3        &color,
                thread   float3        &direction,
@@ -309,20 +426,22 @@ inline void TraceRay (
                constant  Object*       objects,
                constant uint&          num_objects,
                thread   uint          &state,
-               constant Material*      starting_volume  // raw pointers on gpu's are just so wonderful...
+               constant Material*      starting_volume,  // raw pointers on gpu's are just so wonderful...
+               constant Light*         lights,
+               constant uint          &num_lights
 ) {
     // color represents the color accumulation
     float transmission = 1.;  // transmission represents how much of the color can make it back to the camera
     float3 brightness = float3(0., 0., 0.);  // brightness represents how strong of light can actually make it back to the camera (brightness * color_acc = final color; color_acc += col * transmission)
 
-    float indexes_of_refraction[MAX_BOUNCES + 1];  // acting as a stack; hopefully nothing will overflow
-    constant Material* materials[MAX_BOUNCES + 1];
+    float indexes_of_refraction[STACK_SIZE];  // acting as a stack; hopefully nothing will overflow
+    constant Material* materials[STACK_SIZE];
     materials[0] = starting_volume;
     indexes_of_refraction[0] = 1.0003;  // index 0 would be air/null
     uint index_for_refraction_stack = 0;
 
-    uint object_ids[MAX_BOUNCES + 1];  // acting as a stack; hopefully nothing will overflow
-    object_ids[0] = 0;  // index 0 would be air/null
+    uint object_ids[STACK_SIZE];  // acting as a stack; hopefully nothing will overflow
+    object_ids[0] = 0;  // id 0 would be air/null
     //uint last_object_id_index = 0;  // this stack *should* line up with that of the refractive indexes
 
     for (uint depth = 0; depth < MAX_BOUNCES; depth++) {
@@ -333,32 +452,13 @@ inline void TraceRay (
         uint nearest_index = 0;
         float3 nearest_collision = float3(0., 0., 0.);
         float nearest_distance = 9999999.;  // big number; hopefully bigger than any real object's would have
-        for (uint object_index = 0; object_index < num_objects; object_index++) {
-            Object object = objects[object_index];
-            float mask;
-            float distance_to_collision;  // distance to collision
-            float3 collision_position;
-            RayIntersectsTriangle_Branchless(position, direction, object.point_a, object.point_b, object.point_c, distance_to_collision, collision_position, mask);
-            bool collision_at_point = mask >= 0.99;
-            collided = collided || collision_at_point;
-            nearest_index = distance_to_collision < nearest_distance && collision_at_point ? object_index : nearest_index;
-            nearest_collision = distance_to_collision < nearest_distance && collision_at_point ? collision_position : nearest_collision;
-            nearest_distance = distance_to_collision < nearest_distance && collision_at_point ? distance_to_collision : nearest_distance;
-        }
+        CheckCollisions(objects, num_objects, collided, nearest_index, nearest_distance, nearest_collision, position, direction);
 
-        // while this will introduce divergence, it won't hurt performance
-        // if a ray exits early, but others continue to MAX_BOUNCES, it'll still do the same work
-        // if all rays don't hit the maximum depth, then time will be saved.
-        // there are no looses, but a potential gain in some scenes
         float sun_angle_portion = metal::dot(metal::normalize(float3(0.4, 1.2, 0.3)), direction) * 0.5 + 0.5;
         float clamped = (sun_angle_portion > 1. ? 1. : sun_angle_portion);
         sun_angle_portion = (sun_angle_portion < 0. ? 0. : clamped);
         brightness += (collided ? float3(0., 0., 0.) : float3(4., 4., 5.2)) * float3(transmission * sun_angle_portion, transmission * sun_angle_portion, transmission * sun_angle_portion);
         color += (collided ? float3(0., 0., 0.) : float3(1., 1., 1.)) * float3(transmission * sun_angle_portion, transmission * sun_angle_portion, transmission * sun_angle_portion);
-        if (!collided) break;  // does seem to improve performance quite a bit in open scenes (enclosed ones won't get any benefits, but shouldn't be hurt)
-
-        // making sure once in blank space no further color is accumulated to prevent weird artifacts (to avoid divergence the ray still needs to be calculated)
-        //transmission = collided ? transmission : 0.;
 
         // first checking if scattering needs to first happen
         bool scattered = false;
@@ -370,14 +470,21 @@ inline void TraceRay (
 
         // hopefully this won't cause too much divergence (volumes won't likely be common), but honestly either way the following are going to be redundant (and manually storing the state is complex)
         Object object = objects[nearest_index];
-        float3 corrected_position = position + object.surface_normal * -metal::sign(metal::dot(object.surface_normal, direction)) * float3(0.01, 0.01, 0.01);
-        position = !scattered && object.material.scattering > 0. ? corrected_position : position;  // in case it doesn't scatter and lands on the surface (preventing floating point errors)
+        // the surf normal shouldn't be inverted as it should be passing through
+        float3 corrected_position = position + object.surface_normal * metal::sign(metal::dot(object.surface_normal, direction)) * float3(0.01, 0.01, 0.01);
+        position = object.material.scattering > 0. ? corrected_position : nearest_collision;  // in case it doesn't scatter and lands on the surface (preventing floating point errors)
+        // checking for a nearby light source (MIS/importance sampling for better/quicker results)
+        constant Material* material_collided = scattered ? materials[index_for_refraction_stack] : &objects[nearest_index].material;
+        CheckForLights(position, direction, brightness, transmission, material_collided, object.surface_normal, lights, num_lights, objects, num_objects, state);
+
+        float random_unit_state = Rand(state);
+        if ((!collided && !scattered) || random_unit_state > transmission) break;  // does seem to improve performance quite a bit in open scenes (enclosed ones won't get any benefits, but shouldn't be hurt)
+        transmission = 1.;  // resetting it based on the probability (unsimplified it is transmission / transmission)
         if (scattered || object.material.scattering > 0.) {  continue;  }
-        position = nearest_collision;
 
         // updating the color based on the object's properties
-        brightness += object.material.emission * float3(transmission, transmission, transmission);
         color += object.material.color * float3(transmission, transmission, transmission);
+        brightness += object.material.emission * float3(transmission, transmission, transmission);
         transmission *= (1. - object.material.absorption * (1. - object.material.transmittance));
 
         BounceRay(direction, position, object.surface_normal, object, state, index_for_refraction_stack, indexes_of_refraction, object_ids, materials, &objects[nearest_index].material);
@@ -406,27 +513,24 @@ kernel void TraceRays (
     constant uint&       num_objects [[ buffer(4) ]],
     constant uint&       frame       [[ buffer(5) ]],
     constant Material* starting_volume [[ buffer(6) ]],
+    constant Light*     lights       [[ buffer(7) ]],
+    constant uint&      num_lights   [[ buffer(8) ]],
     uint2 gid [[ thread_position_in_grid ]]
 ) {
     uint pixel_index = gid.y * width + gid.x;
     uint base_index = pixel_index * 3;
 
     // the state for random number generation
-    uint state = pixel_index * 10000 + frame * (width * height * 10000);
+    uint state = pixel_index * 127 + frame * (width * height * 997);
 
-    float3 color = float3(0., 0., 0.);  // getting the average color contribution
-    for (uint i = 0; i < TOTAL_RAYS; i++) {
-        float3 ray_direction;
-        float3 ray_position;
-        GetViewRayDirection(gid, uint2(width, height), state, ray_direction, ray_position);
+    float3 ray_direction;
+    float3 ray_position;
+    GetViewRayDirection(gid, uint2(width, height), state, ray_direction, ray_position);
 
-        float3 ray_color = float3(0., 0., 0.);
-        // ray position and float3 will be mutated so future references are not valid
-        TraceRay(ray_color, ray_direction, ray_position, objects, num_objects, state, starting_volume);
-        color += ray_color;
-    }
-    color /= float3(TOTAL_RAYS, TOTAL_RAYS, TOTAL_RAYS);
-    color = ToneMap_Uncharted2(color);
+    float3 color = float3(0., 0., 0.);
+    // ray position and float3 will be mutated so future references are not valid
+    TraceRay(color, ray_direction, ray_position, objects, num_objects, state, starting_volume, lights, num_lights);
+    //color = ToneMap_Uncharted2(color);
 
     // the color channels are between 0 and 1
     output[base_index + 0] = color.x; // R

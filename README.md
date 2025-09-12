@@ -12,4 +12,7 @@ Supported Materials:
  * Volumetric (in theory weighted and unweighted scattering directions depending on parameters)
  * Emissive
  * And probably more that I'm forgetting
- * *Note: currently the specular parameter doesn't actualy do anything*
+ * *Note: currently the specular parameter doesn't actualy do anything (kinda, kinda not)*
+
+Basic importance sampling was added for unoccluded lights within the same medium as the ray.
+A BVH is now being generated (the generation is needs some optimizations) although it isn't yet being sent to the gpu or used for traversal.

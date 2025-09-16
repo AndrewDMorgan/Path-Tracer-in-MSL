@@ -1,9 +1,7 @@
 use image::{RgbImage, Rgb};
-
 use metal::*;
 
 // the size of the output render
-static MAX_LIGHT_BOUNCES: u32 = 128;
 static WIDTH: u32 = 1080;// * 2;
 static HEIGHT: u32 = 720;// * 2;
 
@@ -13,6 +11,7 @@ static OUTPUT_RENDER_FILE_NAME: &str = "output.png";
 // this has to align with the version defined in msl
 #[derive(Clone, Copy)]
 #[repr(C, align(16))]
+#[derive(serde::Serialize, serde::Deserialize, bincode::Encode, bincode::Decode)]
 struct Object {
     // the extra padding is needed for metal's memory layout to actually align.......
     point_a: [f32; 4],
@@ -62,6 +61,7 @@ impl Object {
 
 #[derive(Clone, Copy)]
 #[repr(C, align(16))]
+#[derive(serde::Serialize, serde::Deserialize, bincode::Encode, bincode::Decode)]
 struct Material {
     roughness: f32,
     absorption: f32,
@@ -269,41 +269,87 @@ fn generate_height_map <const SIZE_X: usize, const SIZE_Y: usize> () -> [[f32; S
     let mut table = [[0.0f32; SIZE_X]; SIZE_Y];
     for x in 0..SIZE_X {
         for y in 0..SIZE_Y {
-            table[y][x] = f32::sin(x as f32 / SIZE_X as f32 * 48. + y as f32 * 0.9) * 0.4;
+            table[y][x] = f32::sin(x as f32 / SIZE_X as f32 * 24. + y as f32 / SIZE_Y as f32 * 5.9) * 0.15;
+            table[y][x] += f32::cos(x as f32 / SIZE_X as f32 * 32. - y as f32 / SIZE_Y as f32 * 3.9) * 0.075;
+            table[y][x] += f32::sin(x as f32 / SIZE_X as f32 * 22. - y as f32 / SIZE_Y as f32 * 7.9) * 0.05;
+            table[y][x] += f32::cos(x as f32 / SIZE_X as f32 * 48. + y as f32 / SIZE_Y as f32 * 15.9) * 0.02;
         }
     } table
 }
 
 #[repr(C, align(16))]
+#[derive(serde::Serialize, serde::Deserialize, bincode::Encode, bincode::Decode)]
 pub struct Light {
     index: u32,
     area_weight: f32,
     area: f32,
 }
 
+#[repr(C, align(16))]
+#[derive(Copy, Clone, Debug)]
+#[derive(serde::Serialize, serde::Deserialize, bincode::Encode, bincode::Decode)]
+struct AlignedFloat4([f32; 4]);
+
+impl std::ops::Index<usize> for AlignedFloat4 {
+    type Output = f32; // The type of the element returned by indexing
+    
+    fn index(&self, index: usize) -> &Self::Output {
+        // Perform bounds checking and return a reference to the element
+        &self.0[index]
+    }
+}
+
+impl std::ops::IndexMut<usize> for AlignedUint4 {
+    fn index_mut(&mut self, index: usize) -> &mut Self::Output {
+        &mut self.0[index]
+    }
+}
+
+#[repr(C, align(16))]
+#[derive(Copy, Clone, Debug)]
+#[derive(serde::Serialize, serde::Deserialize, bincode::Encode, bincode::Decode)]
+struct AlignedUint4([u32; 4]);
+
+impl std::ops::Index<usize> for AlignedUint4 {
+    type Output = u32; // The type of the element returned by indexing
+    
+    fn index(&self, index: usize) -> &Self::Output {
+        // Perform bounds checking and return a reference to the element
+        &self.0[index]
+    }
+}
+
+impl std::ops::IndexMut<usize> for AlignedFloat4 {
+    fn index_mut(&mut self, index: usize) -> &mut Self::Output {
+        &mut self.0[index]
+    }
+}
 
 // stores raw pointers to make this and the gpu end structs line up in size without specifying anything
 #[repr(C, align(16))]
 struct PointedBVH <const NODE_STACK_SIZE_MULTIPLE_OF_FOUR: usize> {
-    object_indexes: *const [u32; NODE_STACK_SIZE_MULTIPLE_OF_FOUR],
-    children_aabb: *const [[f32; 4]; 2],
-    children: *const [u32; 4],
+    object_indexes: *const u32,
+    num_objects: *const u32,
+    children_aabb: *const AlignedFloat4,
+    children: *const AlignedUint4,
     objects: *const Object,
 }
 
 // generates the bvh for the scene
 #[repr(C, align(16))]
+#[derive(serde::Serialize, serde::Deserialize, bincode::Encode, bincode::Decode)]
 struct BoundingVolumeHierarchy<
     const NODE_STACK_SIZE_MULTIPLE_OF_FOUR: usize,  // if this is aligned to 16 bytes (multiple of four), everything else should automatically be aligned as each member is by default 16 bytes
 > {
     // each index corresponds to the child's index     stores the index to the children
-    pub object_indexes: Box<[[u32; NODE_STACK_SIZE_MULTIPLE_OF_FOUR]]>,
+    pub object_indexes: Box<[u32]>,
+    pub num_objects: Box<[u32]>,
     // each index corresponds to the child's index (the bounding box; index 1 == position, index 2 == size)   the fourth dimension is just for padding
     // min, max
-    pub children_aabb: Box<[[[f32; 4]; 2]]>,
+    pub children_aabb: Box<[AlignedFloat4]>,
     // binary tree's have 2 children each (indexes to the next child)    the extra two elements are for padding
     // all 0s means it's a leaf with no children
-    pub children: Box<[[u32; 4]]>,
+    pub children: Box<[AlignedUint4]>,
     // all the objects (the object struct is already padded)
     pub objects: Box<[Object]>,
 }
@@ -313,6 +359,7 @@ impl BvhStructure {
     pub fn as_ptr (&self) -> PointedBVH<NODE_STACK_SIZE_MULTIPLE_OF_FOUR> {
         PointedBVH {
             object_indexes: self.object_indexes.as_ptr(),
+            num_objects: self.num_objects.as_ptr(),
             children_aabb: self.children_aabb.as_ptr(),
             children: self.children.as_ptr(),
             objects: self.objects.as_ptr(),
@@ -320,19 +367,25 @@ impl BvhStructure {
     }
     
     // takes ownership of Object to consume it while pushing it into the tree
-    pub fn new (mut objects: Vec<Object>) -> Self {
+    pub fn new (objects: Vec<Object>, object_renders: &mut Vec<ObjectRender>) -> Self {
+        assert_eq!(NUM_NODES % 4, 0);  // making sure it's a multiple of four for safety
         let mut tree = BvhStructure {
-            object_indexes: vec![[0u32; NODE_STACK_SIZE_MULTIPLE_OF_FOUR]; NUM_NODES].into_boxed_slice(),
-            children_aabb: vec![[[0.; 4]; 2]; NUM_NODES].into_boxed_slice(),
-            children: vec![[0; 4]; NUM_NODES].into_boxed_slice(),
+            object_indexes: vec![0u32; NUM_NODES * NODE_STACK_SIZE_MULTIPLE_OF_FOUR].into_boxed_slice(),
+            num_objects: vec![0u32; NUM_NODES].into_boxed_slice(),
+            children_aabb: vec![AlignedFloat4([0.; 4]); NUM_NODES * 2].into_boxed_slice(),
+            children: vec![AlignedUint4([0; 4]); NUM_NODES].into_boxed_slice(),
             objects: vec![Object::null(); NUM_OBJECTS].into_boxed_slice(),
         };
         
         // tracking the node index (the top of the buffer/stack)
-        let mut current_stack_index = 1;  // 0 is the root node, so it should start at 1
+        let mut current_stack_index = 0;  // 0 is the root node, so it should start at 1
         // creating the root node (just a basic bounding box, nothing fancy)
         let (min_bound, max_bound) = Self::get_bounds(&objects);
-        tree.children_aabb[0] = [[min_bound.0, min_bound.1, min_bound.2, 0.], [max_bound.0, max_bound.1, max_bound.2, 0.]];
+        //tree.children_aabb[0] = [[min_bound.0, min_bound.1, min_bound.2, 0.], [max_bound.0, max_bound.1, max_bound.2, 0.]];
+        
+        // x, z
+        ObjectRender::cube(object_renders, min_bound, max_bound, (1., 0., 0.), 0);
+        
         // the children have to be the next two (makes it easy for this iteration
         //tree.children[0] = [1, 2, 0, 0];
         // the root node will not have any geometry unless pushed into it by the splitting process (which would happen in the recursive section)
@@ -344,7 +397,11 @@ impl BvhStructure {
         // either splits the space or concludes the child position as a leaf node
         // each split half takes its respective objects and continues the recursion
         let mut object_count = 0;
-        Self::get_recursive_nodes(&mut tree, &mut current_stack_index, objects, (min_bound, max_bound), 1, &mut object_count);
+        let mut avg_cost = (0., 0.);
+        Self::get_recursive_nodes(&mut tree, &mut current_stack_index, objects, (min_bound, max_bound), 0, &mut object_count, object_renders, &mut avg_cost);
+        println!("Final object count: {}", object_count);
+        
+        println!("Average Cost Per Box: {}", avg_cost.0 / avg_cost.1);
         
         tree
     }
@@ -354,11 +411,18 @@ impl BvhStructure {
                             objects: Vec<Object>,
                             (min_bound, max_bound): ((f32, f32, f32), (f32, f32, f32)),
                             depth: u32,
-                            object_count: &mut usize
+                            object_count: &mut usize,
+                            object_renders: &mut Vec<ObjectRender>,
+                            avg_cost: &mut (f32, f32),
     ) {
+        if *current_stack_index % 25000 == 25000-1 {  println!("Iterated over 25,000 cells.")  }
+        
+        let color = ((*current_stack_index as f32 % 5.) * 0.2, (*current_stack_index as f32 % 128.) / 128., 1. - (*current_stack_index as f32 % 3.) / 3.);
+        ObjectRender::cube(object_renders, min_bound, max_bound, color, depth as usize);
+        
         // assigning the node it's aabb (bounding box)
-        tree.children_aabb[*current_stack_index][0] = [min_bound.0, min_bound.1, min_bound.2, 0.];
-        tree.children_aabb[*current_stack_index][1] = [max_bound.0, max_bound.1, max_bound.2, 0.];
+        tree.children_aabb[*current_stack_index * 2    ] = AlignedFloat4([min_bound.0, min_bound.1, min_bound.2, 0.]);
+        tree.children_aabb[*current_stack_index * 2 + 1] = AlignedFloat4([max_bound.0, max_bound.1, max_bound.2, 0.]);
         
         if depth >= BVH_DEPTH || objects.len() < MIN_OBJECT_SPLIT_COUNT {
             //println!("Depth: {} Objects: {}", depth, objects.len());
@@ -369,59 +433,63 @@ impl BvhStructure {
             // leaf nodes don't really have any special parameters so setup should only include objects (and aabb)
             let mut index = 0;
             for object in objects {  // consumes the bin
-                tree.object_indexes[*current_stack_index][index] = *object_count as u32;
+                ObjectRender::primitive(&object, object_renders, color, depth as usize);
+                tree.object_indexes[*current_stack_index * NODE_STACK_SIZE_MULTIPLE_OF_FOUR + index] = *object_count as u32;
                 tree.objects[*object_count] = object;
                 *object_count += 1;
                 index += 1;
             }
+            tree.num_objects[*current_stack_index] = index as u32;
             *current_stack_index += 1;
             
             return;
         }
+        
         // saving the current stack index - 1 as parent_index
-        let parent_index = *current_stack_index - 1;
+        let parent_index = *current_stack_index;
+        *current_stack_index += 1;
         
         // splitting the volume in three bins (order: left, right, middle)
-        let (left_bin, right_bin, middle_bin) = Self::split_volume(objects, (&min_bound, &max_bound));
+        let (left_bin, right_bin, middle_bin, min_cost) = Self::split_volume(objects, (&min_bound, &max_bound));
+        avg_cost.0 += min_cost; avg_cost.1 += 1.;
         //println!("Split node #{} with {} / {} objects and {} in the middle.", current_stack_index, left_bin.len(), right_bin.len(), middle_bin.len());
         
         // taking all triangles caught inbetween and placing them into parent_index
         let mut index = 0;
         for object in middle_bin {  // consumes the bin
-            tree.object_indexes[parent_index][index] = *object_count as u32;
+            ObjectRender::primitive(&object, object_renders, color, depth as usize);
+            tree.object_indexes[parent_index * NODE_STACK_SIZE_MULTIPLE_OF_FOUR + index] = *object_count as u32;
             tree.objects[*object_count] = object;
             *object_count += 1;
             index += 1;
         }
+        tree.num_objects[parent_index] = index as u32;
         
         // creating a left child at current_stack_index and incrementing the counter
         // updating the first child in parent_index with the stack index before incrementing
         tree.children[parent_index][0] = *current_stack_index as u32;
-        *current_stack_index += 1;
         let bounds = Self::get_bounds(&left_bin);
-        Self::get_recursive_nodes(tree, current_stack_index, left_bin, bounds, depth + 1, object_count);
-        
+        Self::get_recursive_nodes(tree, current_stack_index, left_bin, bounds, depth + 1, object_count, object_renders, avg_cost);
         
         // creating a right child at current_stack_index and incrementing the counter
         // updating the second child in parent_index with the stack index before incrementing
         // with that child, calling the recursive function again
         tree.children[parent_index][1] = *current_stack_index as u32;
-        *current_stack_index += 1;
         let bounds = Self::get_bounds(&right_bin);
-        Self::get_recursive_nodes(tree, current_stack_index, right_bin, bounds, depth + 1, object_count);
+        Self::get_recursive_nodes(tree, current_stack_index, right_bin, bounds, depth + 1, object_count, object_renders, avg_cost);
         
         // concluded
     }
     
     // left, right, overlapping    is the order of return vectors
-    fn split_volume (objects: Vec<Object>, (min_bound, max_bound): (&(f32, f32, f32), &(f32, f32, f32))) -> (Vec<Object>, Vec<Object>, Vec<Object>) {
+    fn split_volume (objects: Vec<Object>, (min_bound, max_bound): (&(f32, f32, f32), &(f32, f32, f32))) -> (Vec<Object>, Vec<Object>, Vec<Object>, f32) {
         // tracking the best point to split at
         let mut min_cost = f32::MAX;
         let mut split_point = ((0., 0., 0.), (0., 0., 0.));
         
         // looping over a set number of triangles to find the approximate best cost
         // max of 1000 objects to check (hopefully not too slow?)
-        let count = usize::min(1000, objects.len());
+        let count = usize::min(MAX_SPLIT_CHECKS, objects.len());
         let ratio = objects.len() as f32 / count as f32;
         for i in 0..count {
             if min_cost < MIN_COST_BREAK {  break;  }
@@ -483,8 +551,8 @@ impl BvhStructure {
             (max_bound.1 - min_bound.1) * (max_bound.2 - min_bound.2) * 2.;
         
         // taking the best split and finding all objects for each bin
-        let mut bin_left = Vec::with_capacity(objects.len() / 2);
-        let mut bin_right = Vec::with_capacity(objects.len() / 2);
+        let mut bin_left = Vec::with_capacity(objects.len() / 2 + 20);
+        let mut bin_right = Vec::with_capacity(objects.len() / 2 + 20);
         let mut bin_middle = Vec::with_capacity(16);  // this hopefully won't have very many
         // now consuming the objects vector to place them into their respective containers
         //println!("Split volume; bounding boxes: {:?}, {:?} and {:?}, {:?} costing: {}", min_bound, &split_point, &split_point, max_bound, min_cost);
@@ -498,7 +566,7 @@ impl BvhStructure {
             // swapping between placement options based on the size of the triangle (tiny ones can overhang, but giant ones need to be centered
             let placement = {
                 let triangle_area = 0.5 * length(cross(sub_l(object.point_b, object.point_a), sub_l(object.point_c, object.point_a)));
-                if (triangle_area / box_area) < 0.01 || triangle_area < 0.05 {
+                if (triangle_area / box_area) < 0.15 || triangle_area < 1.5 {
                     Self::check_bin_placement(
                         [&center, &center, &center],
                         (min_bound, &split_point.1),
@@ -517,7 +585,7 @@ impl BvhStructure {
                 (1, 1, 1) => {&mut bin_right},
                 _ => {&mut bin_middle},
             }.push(object);
-        } (bin_left, bin_right, bin_middle)
+        } (bin_left, bin_right, bin_middle, min_cost)
     }
     
     fn check_bounds (point: &[f32; 4], (min_bound, max_bound): (&(f32, f32, f32), &(f32, f32, f32))) -> bool {
@@ -574,9 +642,19 @@ impl BvhStructure {
         
         let mut left_count = 0;
         let mut right_count = 0;
-        let mut middle_count = 0;
+        let mut _middle_count = 0;
         
-        for object in objects {
+        let mut min_bound_found_left = (min_bound_left.0, min_bound_left.1, min_bound_left.2);
+        let mut max_bound_found_left = (max_bound_left.0, max_bound_left.1, max_bound_left.2);
+        let mut min_bound_found_right = (min_bound_right.0, min_bound_right.1, min_bound_right.2);
+        let mut max_bound_found_right = (max_bound_right.0, max_bound_right.1, max_bound_right.2);
+        
+        // only sampling a subset to reduce computational cost while hopefully not impacting the quality of the bvh
+        let count = u32::max(u32::min(MIN_OBJECT_SAMPLES, objects.len() as u32), objects.len() as u32 / OBJECT_SAMPLE_REDUCTION);
+        let ratio = objects.len() as f32 / count as f32;
+        for index in 0..count {
+            let object = &objects[(index as f32 * ratio) as usize];
+            
             // going through each object, finding which bin it belongs in, and adding it's surface area respectively
             let placement = Self::check_bin_placement(
                 [&object.point_a, &object.point_b, &object.point_c],
@@ -585,22 +663,45 @@ impl BvhStructure {
             );
             let triangle_area = 0.5 * length(cross(sub_l(object.point_b, object.point_a), sub_l(object.point_c, object.point_a)));
             match placement {
-                (0, 0, 0) => {total_area_left += triangle_area; left_count += 1;},
-                (1, 1, 1) => {total_area_right += triangle_area; right_count += 1;},
-                _ => {total_area_middle += triangle_area; middle_count += 1;},
+                (0, 0, 0) => {
+                    min_bound_found_left = (f32::min(min_bound_left.0, min_bound_found_left.0),
+                                            f32::min(min_bound_left.1, min_bound_found_left.1),
+                                            f32::min(min_bound_left.2, min_bound_found_left.2));
+                    max_bound_found_left = (f32::max(max_bound_left.0, max_bound_found_left.0),
+                                            f32::max(max_bound_left.1, max_bound_found_left.1),
+                                            f32::max(max_bound_left.2, max_bound_found_left.2));
+                    total_area_left += triangle_area;
+                    left_count += 1;
+                },
+                (1, 1, 1) => {
+                    min_bound_found_right = (f32::min(min_bound_right.0, min_bound_found_right.0),
+                                             f32::min(min_bound_right.1, min_bound_found_right.1),
+                                             f32::min(min_bound_right.2, min_bound_found_right.2));
+                    max_bound_found_right = (f32::max(max_bound_right.0, max_bound_found_right.0),
+                                             f32::max(max_bound_right.1, max_bound_found_right.1),
+                                             f32::max(max_bound_right.2, max_bound_found_right.2));
+                    total_area_right += triangle_area;
+                    right_count += 1;
+                },
+                _ => {
+                    total_area_middle += triangle_area;
+                    _middle_count += 1;
+                },
             }
         }
         
+        // getting the new left and right bounding box sizes (should improve the calculations by a lot?)
+        
         // getting the sizes of the bounding boxes
         let size_left = (
-            max_bound_left.0 - min_bound_left.0,
-            max_bound_left.1 - min_bound_left.1,
-            max_bound_left.2 - min_bound_left.2,
+            max_bound_found_left.0 - min_bound_found_left.0,
+            max_bound_found_left.1 - min_bound_found_left.1,
+            max_bound_found_left.2 - min_bound_found_left.2,
         );
         let size_right = (
-            max_bound_right.0 - min_bound_right.0,
-            max_bound_right.1 - min_bound_right.1,
-            max_bound_right.2 - min_bound_right.2,
+            max_bound_found_right.0 - min_bound_found_right.0,
+            max_bound_found_right.1 - min_bound_found_right.1,
+            max_bound_found_right.2 - min_bound_found_right.2,
         );
         let size_parent = (
             max_bound_parent.0 - min_bound_parent.0,
@@ -615,9 +716,13 @@ impl BvhStructure {
         let surface_area_right = (size_right.0 * size_right.1 * 2.) + (size_right.1 * size_right.2 * 2.) + (size_right.0 * size_right.2 * 2.);
         let surface_area_parent = (size_parent.0 * size_parent.1 * 2.) + (size_parent.1 * size_parent.2 * 2.) + (size_parent.0 * size_parent.2 * 2.);
         
-        if left_count == 0 || right_count == 0 {  return f32::INFINITY;  }
+        if left_count == 0 || right_count == 0 {  return match (right_count + left_count) > MIN_OBJECT_SPLIT_COUNT {
+            true => f32::MAX,
+            false => 250.,
+        } }
+        if surface_area_right < 0.0000001 || surface_area_left < 0.0000001 {  return f32::MAX;  }
         
-        const K: f32 = 0.25;  // the weight for triangles that are caught between
+        const K: f32 = 0.75;  // the weight for triangles that are caught between
         // calculating the final cost
         surface_area_left / surface_area_parent * total_area_left + surface_area_right / surface_area_parent * total_area_right + K * total_area_middle + f32::abs(left_count as f32 - right_count as f32) * 10.
         // sleft / sparent * aleft + sright / sparent * aright + k(a const between 1 and 2 to taste) * amiddle
@@ -629,31 +734,203 @@ impl BvhStructure {
         let mut max = (f32::MIN, f32::MIN, f32::MIN);
         
         for object in objects {
-            min.0 = f32::min(f32::min(min.0, object.point_a[0]), f32::min(object.point_b[0], object.point_c[0]));
-            min.1 = f32::min(f32::min(min.1, object.point_a[1]), f32::min(object.point_b[1], object.point_c[1]));
-            min.2 = f32::min(f32::min(min.2, object.point_a[2]), f32::min(object.point_b[2], object.point_c[2]));
+            min.0 = f32::min(f32::min(min.0, object.point_a[0]), f32::min(object.point_b[0], object.point_c[0])) - 0.000001;
+            min.1 = f32::min(f32::min(min.1, object.point_a[1]), f32::min(object.point_b[1], object.point_c[1])) - 0.000001;
+            min.2 = f32::min(f32::min(min.2, object.point_a[2]), f32::min(object.point_b[2], object.point_c[2])) - 0.000001;
             
-            max.0 = f32::max(f32::max(max.0, object.point_a[0]), f32::max(object.point_b[0], object.point_c[0]));
-            max.1 = f32::max(f32::max(max.1, object.point_a[1]), f32::max(object.point_b[1], object.point_c[1]));
-            max.2 = f32::max(f32::max(max.2, object.point_a[2]), f32::max(object.point_b[2], object.point_c[2]));
+            max.0 = f32::max(f32::max(max.0, object.point_a[0]), f32::max(object.point_b[0], object.point_c[0])) + 0.000001;
+            max.1 = f32::max(f32::max(max.1, object.point_a[1]), f32::max(object.point_b[1], object.point_c[1])) + 0.000001;
+            max.2 = f32::max(f32::max(max.2, object.point_a[2]), f32::max(object.point_b[2], object.point_c[2])) + 0.000001;
         }
         (min, max)
     }
 }
 
-// Suppose these are the constants you want to fix for convenience
-const BVH_DEPTH: u32 = 24;
-const NUM_OBJECTS: usize = 250000;
-const NODE_STACK_SIZE_MULTIPLE_OF_FOUR: usize = 32;  // make sure to update the version in metal defined at the top
-const MIN_OBJECT_SPLIT_COUNT: usize = 16;
-const MIN_COST_BREAK: f32 = 100.;
+/*
+    On Bad Settings (≈6.958 seconds for a cost of 42.58)
+Time: 54.041914959
+Per Ray AVG: 0.270209574795
 
-const NUM_NODES: usize = (u32::pow(2, BVH_DEPTH + 1) - 1) as usize;
+    On Good Settings (≈267.4076 seconds for a cost of 15.9)
+Time: 45.021721584
+Per Ray AVG: 0.22510860791999998
+
+Difference of 0.04510096687
+
+17% speed up or something like that (not terrible)
+*/
+// Suppose these are the constants you want to fix for convenience
+const BVH_DEPTH: u32 = 18;
+const NUM_OBJECTS: usize = 200_000;  // this just has to be larger than the actual count of objects
+const NODE_STACK_SIZE_MULTIPLE_OF_FOUR: usize = 16;  // make sure to update the version in metal defined at the top
+const MIN_OBJECT_SPLIT_COUNT: usize = 4;
+const MIN_COST_BREAK: f32 = 5.;
+const MAX_SPLIT_CHECKS: usize = 15_000;
+const MIN_OBJECT_SAMPLES: u32 = 15_000;
+const OBJECT_SAMPLE_REDUCTION: u32 = 2;
+
+const NUM_NODES: usize = multiple_of_four((u32::pow(2, BVH_DEPTH + 1) - 1) as usize);
+// should crash at compile time if the constant isn't a multiple of 4 (protecting against memory misalignment)
+const _: [(); 0] = [(); (NODE_STACK_SIZE_MULTIPLE_OF_FOUR % 8 == 0) as usize - 1];
 // Create a type alias for BVH with those generics
-const _: [(); 0] = [(); (NODE_STACK_SIZE_MULTIPLE_OF_FOUR % 4 == 0) as usize - 1];
 type BvhStructure = BoundingVolumeHierarchy<NODE_STACK_SIZE_MULTIPLE_OF_FOUR>;
 
+// turns any value into a multiple of four (very important for byte alignment on the gpu)
+const fn multiple_of_four (value: usize) -> usize {  value + (4 - (value % 4))  }
+
+#[derive(serde::Serialize, serde::Deserialize, bincode::Encode, bincode::Decode)]
+enum RenderType {
+    Line,
+    Primitive,
+}
+
+#[derive(serde::Serialize, serde::Deserialize, bincode::Encode, bincode::Decode)]
+struct ObjectRender {
+    vertexes: Vec<(f32, f32, f32)>,
+    color: (f32, f32, f32),
+    id_group: usize,
+    render_type: RenderType,
+}
+
+#[derive(Default, Clone)]
+#[derive(serde::Serialize, serde::Deserialize, bincode::Encode, bincode::Decode)]
+struct Renderer {
+    vertexes: Vec<(f32, f32, f32, u8, u8, u8)>,
+    edges: Vec<[usize; 2]>,
+    polygons: Vec<[usize; 3]>,
+}
+
+impl Renderer {
+    pub fn add_geometry (&mut self, vertices: Vec<(f32, f32, f32)>, color: (f32, f32, f32), geometry_type: RenderType) {
+        let vertex_count = self.vertexes.len();
+        match geometry_type {
+            RenderType::Line => {
+                // breaking it into discrete edges (assuming a quad)
+                self.edges.push([vertex_count, vertex_count + 1]);
+                self.edges.push([vertex_count + 1, vertex_count + 2]);
+                self.edges.push([vertex_count + 2, vertex_count + 3]);
+                self.edges.push([vertex_count + 3, vertex_count]);
+            },
+            RenderType::Primitive => {
+                self.polygons.push([
+                    vertex_count, vertex_count + 1, vertex_count + 2
+                ]);
+            }
+        }
+        // adding the vertices
+        let color = ((color.0 * 255.) as u8, (color.1 * 255.) as u8, (color.2 * 255.) as u8);
+        for vert in vertices {
+            self.vertexes.push((vert.0, vert.1, vert.2, color.0, color.1, color.2));
+        }
+    }
+    
+    pub fn save (self, file_name: &str) {
+        // printing the size of the save file
+        println!("File {};\n * Edges/4: {}\n * Triangles: {}", file_name, self.edges.len() / 4 / 6, self.polygons.len());
+        
+        // saving the file
+        let header_text = format!(
+r#"ply
+format ascii 1.0
+comment PLY with vertices, colors, edges, and faces
+
+element vertex {}
+property float x
+property float y
+property float z
+property uchar red
+property uchar green
+property uchar blue
+
+element face {}
+property list uchar int vertex_indices
+
+end_header
+"#, self.vertexes.len(), self.edges.len() + self.polygons.len());
+        // starting with vertexes
+        let mut text = String::new();
+        for vert in self.vertexes {
+            // x y z r g b
+            text.push_str(&format!("\n{} {} {} {} {} {}", vert.0, vert.1, vert.2, vert.3, vert.4, vert.5));
+        }
+        
+        // going through edges
+        for edge in self.edges {
+            // index1 index2
+            // generating a quad to cover it
+            text.push_str(&format!("\n3 {} {} {}", edge[0], edge[1], edge[0]));
+        }
+        
+        // finally, adding the faces
+        for face in self.polygons {
+            // 3 index1 index2 index3
+            text.push_str(&format!("\n3 {} {} {}", face[0], face[1], face[2]));
+        }
+        
+        std::fs::write(file_name, format!("{}\n{}\n", header_text, text)).unwrap();
+    }
+}
+
+impl ObjectRender {
+    pub fn save <const DEPTH: usize> (object_renders: Vec<ObjectRender>, file_name: &str) {
+        // going through and creating a file for each id grouping
+        let mut renderers = vec![Renderer::default(); DEPTH + 1];
+        for object in object_renders {
+            renderers[object.id_group].add_geometry(object.vertexes, object.color, object.render_type);
+        }
+        let mut index = 0;
+        for renderer in renderers {
+            renderer.save(&format!("/Users/Andrew/Desktop/Programing/Rust/WaveFrontPathTracing/bounding_boxes/{}{}", index, file_name));
+            index += 1;
+        }
+    }
+    
+    pub fn primitive (object: &Object, object_renders: &mut Vec<ObjectRender>, color: (f32, f32, f32), id_group: usize) {
+        object_renders.push(ObjectRender {
+            vertexes: vec![(object.point_a[0], object.point_a[1], object.point_a[2]), (object.point_b[0], object.point_b[1], object.point_b[2]), (object.point_c[0], object.point_c[1], object.point_c[2])],
+            color, id_group, render_type: RenderType::Primitive
+        });
+    }
+    
+    pub fn cube (object_renders: &mut Vec<ObjectRender>, min_bound: (f32, f32, f32), max_bound: (f32, f32, f32), color: (f32, f32, f32), id_group: usize) {
+        object_renders.push(ObjectRender {
+            vertexes: vec![(min_bound.0, min_bound.1, min_bound.2), (max_bound.0, min_bound.1, min_bound.2), (max_bound.0, min_bound.1, max_bound.2), (min_bound.0, min_bound.1, max_bound.2)],
+            color, id_group, render_type: RenderType::Line
+        });
+        object_renders.push(ObjectRender {
+            vertexes: vec![(min_bound.0, max_bound.1, min_bound.2), (max_bound.0, max_bound.1, min_bound.2), (max_bound.0, max_bound.1, max_bound.2), (min_bound.0, max_bound.1, max_bound.2)],
+            color, id_group, render_type: RenderType::Line
+        });
+        
+        // y, z
+        object_renders.push(ObjectRender {
+            vertexes: vec![(min_bound.0, min_bound.1, min_bound.2), (min_bound.0, max_bound.1, min_bound.2), (min_bound.0, max_bound.1, max_bound.2), (min_bound.0, min_bound.1, max_bound.2)],
+            color, id_group, render_type: RenderType::Line
+        });
+        object_renders.push(ObjectRender {
+            vertexes: vec![(max_bound.0, min_bound.1, min_bound.2), (max_bound.0, max_bound.1, min_bound.2), (max_bound.0, max_bound.1, max_bound.2), (max_bound.0, min_bound.1, max_bound.2)],
+            color, id_group, render_type: RenderType::Line
+        });
+        
+        // x, y
+        object_renders.push(ObjectRender {
+            vertexes: vec![(min_bound.0, min_bound.1, min_bound.2), (max_bound.0, min_bound.1, min_bound.2), (max_bound.0, max_bound.1, min_bound.2), (min_bound.0, max_bound.1, min_bound.2)],
+            color, id_group, render_type: RenderType::Line
+        });
+        object_renders.push(ObjectRender {
+            vertexes: vec![(min_bound.0, min_bound.1, max_bound.2), (max_bound.0, min_bound.1, max_bound.2), (max_bound.0, max_bound.1, max_bound.2), (min_bound.0, max_bound.1, max_bound.2)],
+            color, id_group, render_type: RenderType::Line
+        });
+    }
+}
+
 fn main() {
+    const SAVE_BVH: bool = false;
+    const LOAD_BVH_SAVE: bool = true;
+    const BVH_SAVE_FILE: &str = "bvh_swimming_pool_long_compute.bin";
+    const SAVE_BVH_RENDER: bool = false;  // doesn't really cost a lot tbh, and looks cool
+    const BVH_RENDER_SAVE_FILE: &str = "bounding_box.ply";
+    
     let device = Device::system_default().expect("No Metal device found");
     
     // Write shader source as a raw string
@@ -753,7 +1030,7 @@ fn main() {
             0.5, 0.3, 0., 1.003, 0., (0., 0., 0.), (0.3, 0.3, 0.3)
         ), 5),*/
     ].concat();*/
-    let total_frames = 2500;
+    let total_frames = 50_000;
     let starting_volume = Material::new(0., 0., 0., 1.003, 0., 0., 0., true, (0., 0., 0.), (0., 0., 0.));
     let wall_mat = Material::new(
         0.9, 0.4, 0., 1.003, 0., 0., 0., false, (0., 0., 0.), (0.9, 0.9, 1.)
@@ -791,7 +1068,7 @@ fn main() {
         ],
         create_mesh::<256, 256>(
             Material::new(
-                0., 0.8, 1., 1.333, 0., 0., 0., false, (0., 0., 0.), (0., 0.25, 0.35)
+                0., 0.7, 1., 1.333, 0., 0., 0., false, (0., 0., 0.), (0., 0.25, 0.35)
             ),
             2,
             (-6., -6., -25.),
@@ -802,18 +1079,67 @@ fn main() {
     ].concat();
     
     // generating the bvh
-    let vector = input.clone();  // temporary while i still use the whole object vector
-    println!("Constructing BVH for {} objects", vector.len());
+    //let vector = input.clone();  // temporary while i still use the whole object vector
+    let object_count = input.len();
+    println!("Constructing or Loading BVH for {} objects", object_count);
     let start = std::time::Instant::now();
-    let bvh = BvhStructure::new(vector);
-    println!("Finished Constructing BVH in {} seconds", start.elapsed().as_secs_f64());
+    let mut object_renders = vec![];
+    
+    let bvh = {
+        if LOAD_BVH_SAVE {
+            // --- Load struct from file ---
+            let config = bincode::config::standard();
+            let data = std::fs::read(BVH_SAVE_FILE).unwrap();
+            let (decoded, _len): (BvhStructure, usize) = bincode::decode_from_slice(&data, config).unwrap();
+            decoded
+        } else {
+            BvhStructure::new(input, &mut object_renders)
+        }
+    };
+    println!("Finished Constructing or Loading BVH in {} seconds", start.elapsed().as_secs_f64());
+    if SAVE_BVH && !LOAD_BVH_SAVE {
+        // --- Save struct to file ---
+        let config = bincode::config::standard();
+        let encoded: Vec<u8> = bincode::encode_to_vec(&bvh, config).unwrap();
+        std::fs::write(BVH_SAVE_FILE, &encoded).unwrap();  // just dump to file
+    }
+    println!("Finished saving BVH.");
+    
+    //println!("First set of children: {:?}", &bvh.children[..10]);
+    //println!("First set of indexes: {:?}", &bvh.object_indexes[..25]);
+    //println!("First set of aabb's: {:?}", &bvh.children_aabb[..10]);
+    //println!("First set of sizes: {:?}", &bvh.num_objects[..25]);
+    
+    // going through the tree and counting all the boxes to ensure correct counts
+    // this ideally should directly line up with that returned by the renderers as they are confirmed to be working
+    let mut depth = 0;
+    let mut next_depth = vec![0u32];
+    while !next_depth.is_empty() {
+        println!("At depth {}, there are {} boxes.", depth, next_depth.len());
+        let mut new_depth = vec![];
+        let mut triangles = 0;
+        for index in next_depth {
+            triangles += bvh.num_objects[index as usize];
+            if bvh.children[index as usize][0] == 0 {  continue;  }
+            new_depth.push(bvh.children[index as usize][0]);
+            new_depth.push(bvh.children[index as usize][1]);
+        }
+        println!(" * and {} geometric primitives.", triangles);
+        next_depth = new_depth;
+        depth += 1;
+    }
+    
+    // saving the calculated bounding boxes into an .obj file
+    const DEPTH_ARG: usize = BVH_DEPTH as usize;
+    if SAVE_BVH_RENDER {  ObjectRender::save::<DEPTH_ARG>(object_renders, BVH_RENDER_SAVE_FILE);  }
     
     // calculating all lights, their areas, and averaging
     // emmisive_triangle_area / total_emmisive_triangles_combined_area
     let mut total_area = 0f32;
     let mut light_sources: Vec<Light> = vec![];
     let mut light_source_indexes = vec![];
-    for (index, object) in input.iter().enumerate() {
+    for index in 0..object_count {
+        let object = &bvh.objects[index];
         if object.material.emission.iter().sum::<f32>() > 0.01 {
             // calculating the area
             let triangle_area = 0.5 * length(cross(sub_l(object.point_b, object.point_a), sub_l(object.point_c, object.point_a)));
@@ -850,11 +1176,40 @@ fn main() {
     
     let command_queue = device.new_command_queue();
     
-    let in_buf = device.new_buffer_with_data(
-        input.as_ptr() as *const _,
-        (input.len() * size_of::<Object>()) as u64,
+    let in_buf_1 = device.new_buffer_with_data(
+        bvh.object_indexes.as_ptr() as *const [u32; NODE_STACK_SIZE_MULTIPLE_OF_FOUR] as *const _,
+        (bvh.object_indexes.len() * size_of::<u32>()) as u64,
         MTLResourceOptions::StorageModeShared,
     );
+    let in_buf_2 = device.new_buffer_with_data(
+        bvh.num_objects.as_ptr() as *const u32 as *const _,
+        (bvh.num_objects.len() * size_of::<u32>()) as u64,
+        MTLResourceOptions::StorageModeShared,
+    );
+    let in_buf_3 = device.new_buffer_with_data(
+        bvh.children_aabb.as_ptr() as *const [AlignedFloat4; 2] as *const _,
+        (bvh.children_aabb.len() * size_of::<AlignedFloat4>()) as u64,
+        MTLResourceOptions::StorageModeShared,
+    );
+    let in_buf_4 = device.new_buffer_with_data(
+        bvh.children.as_ptr() as *const AlignedUint4 as *const _,
+        (bvh.children.len() * size_of::<AlignedUint4>()) as u64,
+        MTLResourceOptions::StorageModeShared,
+    );
+    let in_buf_5 = device.new_buffer_with_data(
+        bvh.objects.as_ptr() as *const Object as *const _,
+        (bvh.objects.len() * size_of::<Object>()) as u64,
+        MTLResourceOptions::StorageModeShared,
+    );
+    
+    const DEBUG_LENGTH: usize = 50;
+    let debug_arr = [0f32; DEBUG_LENGTH];
+    let debug_buf = device.new_buffer_with_data(
+        debug_arr.as_ptr() as *const [f32; DEBUG_LENGTH] as *const _,
+        (DEBUG_LENGTH * size_of::<f32>()) as u64,
+        MTLResourceOptions::StorageModeShared,
+    );
+    
     let out_buf = device.new_buffer(
         (COUNT * size_of::<f32>()) as u64,
         MTLResourceOptions::StorageModeShared,
@@ -869,11 +1224,11 @@ fn main() {
         size_of::<u32>() as u64,
         MTLResourceOptions::StorageModeShared,
     );
-    let input_size_buf = device.new_buffer_with_data(
+    /*let input_size_buf = device.new_buffer_with_data(
         &input.len() as *const _ as *const _,
         size_of::<u32>() as u64,
         MTLResourceOptions::StorageModeShared,
-    );
+    );*/
     let mut frame = 0u32;
     let frame_count_buf = device.new_buffer_with_data(
         &frame as *const _ as *const _,
@@ -906,15 +1261,20 @@ fn main() {
         let command_buffer = command_queue.new_command_buffer();
         let encoder = command_buffer.new_compute_command_encoder();
         encoder.set_compute_pipeline_state(&pipeline_state);
-        encoder.set_buffer(0, Some(&in_buf), 0);
-        encoder.set_buffer(1, Some(&out_buf), 0);
-        encoder.set_buffer(2, Some(&width_buf), 0);
-        encoder.set_buffer(3, Some(&height_buff), 0);
-        encoder.set_buffer(4, Some(&input_size_buf), 0);
-        encoder.set_buffer(5, Some(&frame_count_buf), 0);
-        encoder.set_buffer(6, Some(&starting_volume_buf), 0);
-        encoder.set_buffer(7, Some(&lights_buf), 0);
-        encoder.set_buffer(8, Some(&num_lights_buf), 0);
+        encoder.set_buffer(0, Some(&out_buf), 0);
+        encoder.set_buffer(1, Some(&width_buf), 0);
+        encoder.set_buffer(2, Some(&height_buff), 0);
+        //encoder.set_buffer(4, Some(&input_size_buf), 0);
+        encoder.set_buffer(3, Some(&frame_count_buf), 0);
+        encoder.set_buffer(4, Some(&starting_volume_buf), 0);
+        encoder.set_buffer(5, Some(&lights_buf), 0);
+        encoder.set_buffer(6, Some(&num_lights_buf), 0);
+        encoder.set_buffer(7 , Some(&debug_buf), 0);
+        encoder.set_buffer(8 , Some(&in_buf_1), 0);
+        encoder.set_buffer(9 , Some(&in_buf_2), 0);
+        encoder.set_buffer(10, Some(&in_buf_3), 0);
+        encoder.set_buffer(11, Some(&in_buf_4), 0);
+        encoder.set_buffer(12, Some(&in_buf_5), 0);
         
         let grid_size = MTLSize {
             width: WIDTH as NSUInteger,
@@ -931,6 +1291,13 @@ fn main() {
         encoder.end_encoding();
         command_buffer.commit();
         command_buffer.wait_until_completed();
+        
+        let out_ptr = debug_buf.contents() as *const f32;
+        if out_ptr.is_null() {  continue;  }
+        let result = unsafe { std::slice::from_raw_parts(out_ptr, DEBUG_LENGTH) };
+        println!("Debug: {:?}", result);
+        let end = frame_start.elapsed().as_secs_f64();
+        println!("Time: {}\nPer Ray AVG: {}", end, end / frame as f64);
         
         let out_ptr = out_buf.contents() as *const f32;
         if out_ptr.is_null() {  continue;  }

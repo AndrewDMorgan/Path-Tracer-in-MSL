@@ -6,3 +6,5 @@ edition = "2024"
 [dependencies]
 image = "0.25.6"
 metal = "0.32.0"
+serde = { version = "1.0", features = ["derive"] }
+bincode = { version = "2.0.1", features = ["derive"] }

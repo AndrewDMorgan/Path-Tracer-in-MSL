@@ -15,6 +15,7 @@
 #define MAX_BOUNCES 8
 
 #define NODE_STACK_SIZE_MULTIPLE_OF_FOUR 16  // this needs to be equal to the rust end
+#define MAX_BVH_STACK_DEPTH 32  // needs to be 2 * max_depth to ensure no overflows, or lower with risk for performance
 
 // ================================================ Random Number Generators and Helper Functions ================================================
 
@@ -79,13 +80,6 @@ struct Object {
     Material material;
 };
 
-struct BVH {
-    device uint (*object_indexes)[NODE_STACK_SIZE_MULTIPLE_OF_FOUR];
-    device float4 (*children_aabb)[2];
-    device uint4 *children;
-    device Object *objects;
-};
-
 // ================================================ Gathering the Initial Ray Information ================================================
 
 // generates the view angle based on the pixel coordinate
@@ -137,7 +131,201 @@ inline void GetViewRayDirection (uint2 gid, uint2 size, thread uint &state, thre
     direction = metal::normalize(focal_point - position);
 }
 
-// ================================================ Tracking the Ray ================================================
+// ================================================ Collisions ================================================
+
+inline void RayIntersectsTriangle_Branchless (
+    thread const float3 &origin,
+    thread const float3 &direction,
+    float3 A,
+    float3 B,
+    float3 C,
+    thread float &t_out,
+    thread float3 &position_out,
+    thread float &mask // 1.0 if intersecting, 0.0 otherwise
+) {
+    const float EPSILON = 0.0001;
+
+    float3 edge1 = B - A;
+    float3 edge2 = C - A;
+    float3 h = metal::cross(direction, edge2);
+    float det = metal::dot(edge1, h);
+
+    float invDet = 1.0 / (det + (det == 0.0 ? EPSILON : 0.0)); // avoid division by zero
+
+    float3 s = origin - A;
+    float u = metal::dot(s, h) * invDet;
+    float3 q = metal::cross(s, edge1);
+    float v = metal::dot(direction, q) * invDet;
+    float t = metal::dot(edge2, q) * invDet;
+
+    // branchless masks
+    float mask_det = metal::step(EPSILON, metal::abs(det));
+    float mask_u = metal::step(0.0, u) * metal::step(u, 1.0);
+    float mask_v = metal::step(0.0, v) * metal::step(u + v, 1.0);
+    float mask_t = metal::step(EPSILON, t);
+
+    mask = mask_det * mask_u * mask_v * mask_t;
+
+    // compute intersection point only if mask != 0
+    position_out = origin + direction * t * mask;
+    t_out = t * mask;
+}
+
+inline void CheckCollisions (constant Object* objects,
+                             constant uint& num_objects,
+                             thread bool& collided,
+                             thread uint& nearest_index,
+                             thread float& nearest_distance,
+                             thread float3& nearest_collision,
+                             thread float3& position,
+                             thread float3& direction
+) {
+    for (uint object_index = 0; object_index < num_objects; object_index++) {
+        Object object = objects[object_index];
+        float mask;
+        float distance_to_collision;  // distance to collision
+        float3 collision_position;
+        RayIntersectsTriangle_Branchless(position, direction, object.point_a, object.point_b, object.point_c, distance_to_collision, collision_position, mask);
+        bool collision_at_point = mask >= 0.99;
+        collided = collided || collision_at_point;
+        nearest_index = distance_to_collision < nearest_distance && collision_at_point ? object_index : nearest_index;
+        nearest_collision = distance_to_collision < nearest_distance && collision_at_point ? collision_position : nearest_collision;
+        nearest_distance = distance_to_collision < nearest_distance && collision_at_point ? distance_to_collision : nearest_distance;
+    }
+}
+
+inline float3 SampleTrianglePoint(constant float3& A, constant float3& B, constant float3& C, thread uint &state) {
+    float u = Rand(state);
+    float v = Rand(state);
+
+    float su = metal::sqrt(u);   // square root warp
+    float b0 = 1.0 - su;
+    float b1 = su * (1.0 - v);
+    float b2 = su * v;
+
+    return b0 * A + b1 * B + b2 * C;
+}
+
+// ================================================ BVH Stuff :( ================================================
+
+// WHY can't I just pass this as a single pointer without breaking it up 20 times, and why can't I use multi-dimensional arrays?
+struct BVH {
+    constant uint *object_indexes;  // * NODE_STACK_SIZE_MULTIPLE_OF_FOUR
+    constant uint *num_objects;
+    constant float4 *children_aabb;  // * 2
+    constant uint4 *children;
+    constant Object *objects;
+};
+
+// slab test
+inline bool CollideAABB (
+    thread float3 &position,
+    thread float3 &inverse_direction,
+    thread float3 &box_min,
+    thread float3 &box_max,
+    thread float &out_distance
+) {
+    // Slab test
+    float3 t0 = (box_min - position) * inverse_direction;
+    float3 t1 = (box_max - position) * inverse_direction;
+
+    float3 tmin3 = metal::min(t0, t1);
+    float3 tmax3 = metal::max(t0, t1);
+
+    // largest near, smallest far
+    float tNear = metal::max(metal::max(tmin3.x, tmin3.y), tmin3.z);
+    float tFar  = metal::min(metal::min(tmax3.x, tmax3.y), tmax3.z);
+
+    out_distance   = metal::max(tNear, 0.);
+    return (tNear <= tFar) && (tFar >= 0.0);
+}
+
+inline void RayIntersectionBVH (
+    thread float3 &position,
+    thread float3 &direction,
+    thread float &out_distance,
+    thread float3 &out_position,
+    thread uint &out_index,  // the index of the object
+    thread bool &collided,
+    thread BVH *bvh,
+    thread uint& hits
+) {
+    float3 inverse_direction = float3(1., 1., 1.) / direction;  // the inverse direction is used a lot and division is slow
+    uint index_stack[MAX_BVH_STACK_DEPTH];
+    uint stack_index = 0;
+
+    // starting with the root
+    float distance;
+    float distance2;
+    float3 box_min = bvh->children_aabb[0].xyz;
+    float3 box_max = bvh->children_aabb[1].xyz;
+    bool hit = CollideAABB(position, inverse_direction, box_min, box_max, distance);
+    stack_index = hit ? 1 : 0;
+    index_stack[0] = 0;  // 0 is the index for the root   (adding regardless, but the previous will cut the loop early if no collision; branchless!)
+
+    out_distance = 99999999.;  // making it a large number to check minimums against
+
+    // iterating
+    Object object;
+    float mask;
+    bool child_1;
+    bool child_2;
+    float collision_distance;
+    float3 collision_position;
+    while (stack_index > 0) {
+        //hits++;
+        // popping off the stack
+        stack_index--;
+        uint index = index_stack[stack_index];
+
+        // checking if it's a leaf node, and if it contains geometry
+        uint4 children = bvh->children[index];
+
+        // checking for intersections with any geometry (leaf or not, it could contain something)
+        uint num_objects = bvh->num_objects[index];
+        for (uint i = 0; i < num_objects; i++) {
+            // checking collision with the object
+            uint object_index = bvh->object_indexes[index * NODE_STACK_SIZE_MULTIPLE_OF_FOUR + i];
+            object = bvh->objects[object_index];
+
+            RayIntersectsTriangle_Branchless(position, direction, object.point_a, object.point_b, object.point_c, collision_distance, collision_position, mask);
+            bool collided_at_point = mask >= 0.99 && collision_distance < out_distance;
+            //hits += uint(mask >= 0.99);
+            out_position = collided_at_point ? collision_position : out_position;
+            out_distance = collided_at_point ? collision_distance : out_distance;
+            out_index = collided_at_point ? object_index : out_index;
+            collided = collided | collided_at_point;
+        }
+
+        // if it's a leaf node, continuing, otherwise adding any collided children
+        if (children.x + children.y == 0) {  continue;  }
+
+        // checking collisions with the children and adding them in order (farthest in first, closest second)
+        // only add children if they are closer (to ensure minimal checks)
+        box_min = bvh->children_aabb[children.x * 2    ].xyz;
+        box_max = bvh->children_aabb[children.x * 2 + 1].xyz;
+        child_1 = CollideAABB(position, inverse_direction, box_min, box_max, distance);
+        child_1 = child_1 && distance < out_distance;  // making sure only children closure than the nearest current intersection are grabbed
+        box_min = bvh->children_aabb[children.y * 2    ].xyz;
+        box_max = bvh->children_aabb[children.y * 2 + 1].xyz;
+        child_2 = CollideAABB(position, inverse_direction, box_min, box_max, distance2);
+        child_2 = child_2 && distance2 < out_distance;  // making sure only children closure than the nearest current intersection are grabbed
+        distance = child_1 ? distance : 999999999.;
+        distance2 = child_2 ? distance2 : 999999999.;
+
+        // ordering them
+        bool2 hit_children = distance < distance2 ? bool2(child_2, child_1) : bool2(child_1, child_2);
+        children = distance < distance2 ? uint4(children.y, children.x, 0, 0) : uint4(children.x, children.y, 0, 0);
+        // adding each child (if they're hit)    please don't take some of these comments out of context.....
+        // this is all branchless (or at least should mostly be)!
+        index_stack[stack_index] = hit_children.x ? children.x : index_stack[stack_index];
+        stack_index = hit_children.x ? stack_index + 1 : stack_index;
+        index_stack[stack_index] = hit_children.y ? children.y : index_stack[stack_index];
+        stack_index = hit_children.y ? stack_index + 1 : stack_index;
+    }
+}
+
+// ================================================ Collision Sampling ================================================
 
 inline float FresnelSchlickAngle(float cosTheta, float R0) {
     return R0 + (1.0 - R0) * metal::pow(1.0 - cosTheta, 5.0);
@@ -240,8 +428,8 @@ inline float GetWeightedMIS (constant Material* material, thread float3 &directi
 // index_of_refraction_ration represents: current_medium_ior / ior_for_medium_being_entered
 inline void BounceRay (thread float3 &direction,
                        thread float3 &position,
-                       thread float3 &surface_normal,
-                       thread Object &object,
+                       constant float3 &normal,
+                       constant Object &object,
                        thread uint &state,
                        thread uint &index_for_refraction_stack,
                        thread float* indexes_of_refraction,
@@ -252,8 +440,8 @@ inline void BounceRay (thread float3 &direction,
     Material material = object.material;
 
     // this should allow any object to be hit from any side and still correctly return the right value
-    float sign = -metal::sign(metal::dot(surface_normal, direction));  // making sure the normal is align regardless of which side is hit
-    surface_normal *= float3(sign, sign, sign);
+    float sign = -metal::sign(metal::dot(normal, direction));  // making sure the normal is align regardless of which side is hit
+    float3 surface_normal = normal * float3(sign, sign, sign);
 
     // getting the index of refraction
     float index_of_refraction_ration = material.index_of_refraction / indexes_of_refraction[index_for_refraction_stack];
@@ -305,78 +493,7 @@ inline void BounceRay (thread float3 &direction,
     materials[index_for_refraction_stack] = need_to_psh ? current_material : materials[index_for_refraction_stack];
 }
 
-inline void RayIntersectsTriangle_Branchless (
-    thread const float3 &origin,
-    thread const float3 &direction,
-    float3 A,
-    float3 B,
-    float3 C,
-    thread float &t_out,
-    thread float3 &position_out,
-    thread float &mask // 1.0 if intersecting, 0.0 otherwise
-) {
-    const float EPSILON = 0.0001;
-
-    float3 edge1 = B - A;
-    float3 edge2 = C - A;
-    float3 h = metal::cross(direction, edge2);
-    float det = metal::dot(edge1, h);
-
-    float invDet = 1.0 / (det + (det == 0.0 ? EPSILON : 0.0)); // avoid division by zero
-
-    float3 s = origin - A;
-    float u = metal::dot(s, h) * invDet;
-    float3 q = metal::cross(s, edge1);
-    float v = metal::dot(direction, q) * invDet;
-    float t = metal::dot(edge2, q) * invDet;
-
-    // branchless masks
-    float mask_det = metal::step(EPSILON, metal::abs(det));
-    float mask_u = metal::step(0.0, u) * metal::step(u, 1.0);
-    float mask_v = metal::step(0.0, v) * metal::step(u + v, 1.0);
-    float mask_t = metal::step(EPSILON, t);
-
-    mask = mask_det * mask_u * mask_v * mask_t;
-
-    // compute intersection point only if mask != 0
-    position_out = origin + direction * t * mask;
-    t_out = t * mask;
-}
-
-inline void CheckCollisions (constant Object* objects,
-                             constant uint& num_objects,
-                             thread bool& collided,
-                             thread uint& nearest_index,
-                             thread float& nearest_distance,
-                             thread float3& nearest_collision,
-                             thread float3& position,
-                             thread float3& direction
-) {
-    for (uint object_index = 0; object_index < num_objects; object_index++) {
-        Object object = objects[object_index];
-        float mask;
-        float distance_to_collision;  // distance to collision
-        float3 collision_position;
-        RayIntersectsTriangle_Branchless(position, direction, object.point_a, object.point_b, object.point_c, distance_to_collision, collision_position, mask);
-        bool collision_at_point = mask >= 0.99;
-        collided = collided || collision_at_point;
-        nearest_index = distance_to_collision < nearest_distance && collision_at_point ? object_index : nearest_index;
-        nearest_collision = distance_to_collision < nearest_distance && collision_at_point ? collision_position : nearest_collision;
-        nearest_distance = distance_to_collision < nearest_distance && collision_at_point ? distance_to_collision : nearest_distance;
-    }
-}
-
-inline float3 SampleTrianglePoint(constant float3& A, constant float3& B, constant float3& C, thread uint &state) {
-    float u = Rand(state);
-    float v = Rand(state);
-
-    float su = metal::sqrt(u);   // square root warp
-    float b0 = 1.0 - su;
-    float b1 = su * (1.0 - v);
-    float b2 = su * v;
-
-    return b0 * A + b1 * B + b2 * C;
-}
+// ================================================ Tracking the Ray ================================================
 
 // why does chatgpt lie so much?
 inline void CheckForLights (thread float3& start_position,
@@ -384,12 +501,12 @@ inline void CheckForLights (thread float3& start_position,
                             thread float3& brightness,
                             thread float& transmission,
                             constant Material* material,
-                            thread float3& normal,
+                            constant float3& normal,
                             constant Light* lights,
                             constant uint& num_lights,
-                            constant Object* objects,
-                            constant uint& num_objects,
-                            thread uint& state
+                            thread BVH* bvh,
+                            thread uint& state,
+                            thread uint& hits
 ) {
     // correcting the direction of the surface normal
     float sign = -metal::sign(metal::dot(direction, normal));
@@ -400,7 +517,7 @@ inline void CheckForLights (thread float3& start_position,
     float random_unit_state = Rand(state);
     uint random_index = uint(random_unit_state * num_lights);
     constant Light* light = &lights[random_index];
-    constant Object* light_object = &objects[light->index];
+    constant Object* light_object = &bvh->objects[light->index];
 
     float3 light_position_sample = SampleTrianglePoint(light_object->point_a, light_object->point_b, light_object->point_c, state);
     float3 direction_to_light = metal::normalize(light_position_sample - position);
@@ -410,7 +527,8 @@ inline void CheckForLights (thread float3& start_position,
     uint nearest_index = 0;
     float3 nearest_collision = float3(0., 0., 0.);
     float nearest_distance = 9999999.;  // big number; hopefully bigger than any real object's would have
-    CheckCollisions(objects, num_objects, collided, nearest_index, nearest_distance, nearest_collision, position, direction_to_light);
+    //CheckCollisions(objects, num_objects, collided, nearest_index, nearest_distance, nearest_collision, position, direction_to_light);
+    RayIntersectionBVH(position, direction, nearest_distance, nearest_collision, nearest_index, collided, bvh, hits);
 
     float pdf = GetWeightedMIS(material, direction, direction_to_light, surface_normal, nearest_distance);
     float weight = light->area_weight * (1. / (nearest_distance * nearest_distance));
@@ -419,12 +537,12 @@ inline void CheckForLights (thread float3& start_position,
     brightness += collided && nearest_index != light->index || metal::isnan(weight) ? float3(0., 0., 0.) : final_emission;
 }
 
-inline void TraceRay (
+inline uint TraceRay (
                thread   float3        &color,
                thread   float3        &direction,
                thread   float3        &position,
-               constant  Object*       objects,
-               constant uint&          num_objects,
+               thread   BVH           *bvh,
+               //constant uint&          num_objects,
                thread   uint          &state,
                constant Material*      starting_volume,  // raw pointers on gpu's are just so wonderful...
                constant Light*         lights,
@@ -444,6 +562,8 @@ inline void TraceRay (
     object_ids[0] = 0;  // id 0 would be air/null
     //uint last_object_id_index = 0;  // this stack *should* line up with that of the refractive indexes
 
+    uint hits = 0;
+
     for (uint depth = 0; depth < MAX_BOUNCES; depth++) {
         // emission sources should have an absorption of 100%; this prevents further light from accumulating while avoiding branch diversion from an early exit
 
@@ -452,7 +572,8 @@ inline void TraceRay (
         uint nearest_index = 0;
         float3 nearest_collision = float3(0., 0., 0.);
         float nearest_distance = 9999999.;  // big number; hopefully bigger than any real object's would have
-        CheckCollisions(objects, num_objects, collided, nearest_index, nearest_distance, nearest_collision, position, direction);
+        //CheckCollisions(bvh, num_objects, collided, nearest_index, nearest_distance, nearest_collision, position, direction);
+        RayIntersectionBVH(position, direction, nearest_distance, nearest_collision, nearest_index, collided, bvh, hits);
 
         float sun_angle_portion = metal::dot(metal::normalize(float3(0.4, 1.2, 0.3)), direction) * 0.5 + 0.5;
         float clamped = (sun_angle_portion > 1. ? 1. : sun_angle_portion);
@@ -469,13 +590,13 @@ inline void TraceRay (
         transmission *= scattered ? (1. - last_material->absorption) : 1.;
 
         // hopefully this won't cause too much divergence (volumes won't likely be common), but honestly either way the following are going to be redundant (and manually storing the state is complex)
-        Object object = objects[nearest_index];
+        constant Object &object = bvh->objects[nearest_index];
         // the surf normal shouldn't be inverted as it should be passing through
         float3 corrected_position = position + object.surface_normal * metal::sign(metal::dot(object.surface_normal, direction)) * float3(0.01, 0.01, 0.01);
         position = object.material.scattering > 0. ? corrected_position : nearest_collision;  // in case it doesn't scatter and lands on the surface (preventing floating point errors)
         // checking for a nearby light source (MIS/importance sampling for better/quicker results)
-        constant Material* material_collided = scattered ? materials[index_for_refraction_stack] : &objects[nearest_index].material;
-        CheckForLights(position, direction, brightness, transmission, material_collided, object.surface_normal, lights, num_lights, objects, num_objects, state);
+        constant Material* material_collided = scattered ? materials[index_for_refraction_stack] : &bvh->objects[nearest_index].material;
+        CheckForLights(position, direction, brightness, transmission, material_collided, object.surface_normal, lights, num_lights, bvh, state, hits);
 
         float random_unit_state = Rand(state);
         if ((!collided && !scattered) || random_unit_state > transmission) break;  // does seem to improve performance quite a bit in open scenes (enclosed ones won't get any benefits, but shouldn't be hurt)
@@ -487,10 +608,11 @@ inline void TraceRay (
         brightness += object.material.emission * float3(transmission, transmission, transmission);
         transmission *= (1. - object.material.absorption * (1. - object.material.transmittance));
 
-        BounceRay(direction, position, object.surface_normal, object, state, index_for_refraction_stack, indexes_of_refraction, object_ids, materials, &objects[nearest_index].material);
+        BounceRay(direction, position, object.surface_normal, object, state, index_for_refraction_stack, indexes_of_refraction, object_ids, materials, &bvh->objects[nearest_index].material);
     }
     // brightness represents how much of each light made it back while the color represents the colors of impacted objects along the path of the light
     color *= brightness;// * float3(transmission, transmission, transmission);
+    return hits;
 }
 
 // ================================================ Main Entry Kernel Function ================================================
@@ -506,17 +628,29 @@ inline float3 ToneMap_Uncharted2(float3 x) {
 }
 
 kernel void TraceRays (
-    constant Object*     objects     [[ buffer(0) ]],
-    device float*        output      [[ buffer(1) ]],
-    constant uint&       width       [[ buffer(2) ]],
-    constant uint&       height      [[ buffer(3) ]],
-    constant uint&       num_objects [[ buffer(4) ]],
-    constant uint&       frame       [[ buffer(5) ]],
-    constant Material* starting_volume [[ buffer(6) ]],
-    constant Light*     lights       [[ buffer(7) ]],
-    constant uint&      num_lights   [[ buffer(8) ]],
+    device  float*      output         [[ buffer(0 ) ]],
+    constant uint&      width          [[ buffer(1 ) ]],
+    constant uint&      height         [[ buffer(2 ) ]],
+    constant uint&      frame          [[ buffer(3 ) ]],
+    constant Material* starting_volume [[ buffer(4 ) ]],
+    constant Light*     lights         [[ buffer(5 ) ]],
+    constant uint&      num_lights     [[ buffer(6 ) ]],
+    device float* debug_buffer         [[ buffer(7 ) ]],
+    constant uint *bvh_object_indexes  [[ buffer(8 ) ]],
+    constant uint *bvh_num_objects     [[ buffer(9 ) ]],
+    constant float4 *bvh_children_aabb [[ buffer(10) ]],
+    constant uint4 *bvh_children       [[ buffer(11) ]],
+    constant Object *bvh_objects       [[ buffer(12) ]],
+
     uint2 gid [[ thread_position_in_grid ]]
 ) {
+    BVH bvh;
+    bvh.object_indexes = bvh_object_indexes;
+    bvh.num_objects    = bvh_num_objects;
+    bvh.children_aabb  = bvh_children_aabb;
+    bvh.children       = bvh_children;
+    bvh.objects        = bvh_objects;
+
     uint pixel_index = gid.y * width + gid.x;
     uint base_index = pixel_index * 3;
 
@@ -529,7 +663,7 @@ kernel void TraceRays (
 
     float3 color = float3(0., 0., 0.);
     // ray position and float3 will be mutated so future references are not valid
-    TraceRay(color, ray_direction, ray_position, objects, num_objects, state, starting_volume, lights, num_lights);
+    uint hits = TraceRay(color, ray_direction, ray_position, &bvh, state, starting_volume, lights, num_lights);
     //color = ToneMap_Uncharted2(color);
 
     // the color channels are between 0 and 1
